@@ -2372,6 +2372,44 @@ class PhotonAdapter(BasePlatformAdapter):
     _OK_EMOJI = "\U0001f44d"
     _FAIL_EMOJI = "\U0001f44e"
 
+    # LOCAL CARRY — not upstream. Context-aware completion tapback.
+    #
+    # The 👍 above is a status light: it says the turn finished, never what the
+    # turn was about. `set_reaction` (tools/set_reaction_tool.py) lets the agent
+    # stage a better one during its turn; we pop it here and use it in place of
+    # _OK_EMOJI. The mailbox is keyed by (chat_id, message_id), so a pick can
+    # only ever land on the message it was made for.
+    #
+    # SUCCESS only. A chosen emoji on a failed turn would be actively
+    # misleading — 👎 still means "this did not work".
+    #
+    # The remove-then-add below duplicates a few lines of the base hook rather
+    # than reusing it. That is deliberate: this adapter is ONE instance serving
+    # every chat, so temporarily rebinding self._OK_EMOJI around an await would
+    # let two concurrent turns hand each other the wrong emoji.
+    async def on_processing_complete(self, event, outcome) -> None:
+        from gateway import pending_reactions
+        from gateway.platforms.base import ProcessingOutcome
+
+        chat_id = getattr(event.source, "chat_id", "") or ""
+        message_id = getattr(event, "message_id", "") or ""
+        chosen = pending_reactions.pop_pending(
+            pending_reactions.make_key(chat_id, message_id)
+        )
+
+        if (
+            not chosen
+            or outcome != ProcessingOutcome.SUCCESS
+            or not self._reactions_enabled()
+        ):
+            await super().on_processing_complete(event, outcome)
+            return
+
+        # Same swap the base hook performs, with the agent's emoji: drop the 👀
+        # progress tapback, then add the chosen one.
+        await self._remove_reaction(chat_id, message_id)
+        await self._add_reaction(chat_id, message_id, chosen)
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return whatever we know about a Spectrum space id.
 
