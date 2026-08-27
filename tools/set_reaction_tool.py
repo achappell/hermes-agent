@@ -40,11 +40,13 @@ def _looks_like_one_emoji(value: str) -> bool:
     return not any(ch.isascii() and ch.isalnum() for ch in value)
 
 
-#: Platforms whose completion hook actually consumes a staged emoji. Photon and
-#: CLI resolve to the same toolset list, so the tool is advertised more widely
-#: than it works — say so plainly here rather than accepting a silent no-op on
-#: Telegram, where a pick would be staged and then never read.
-_CONSUMING_PLATFORMS = frozenset({"photon"})
+#: Platforms whose completion hook actually consumes a staged emoji. The tool is
+#: advertised more widely than it works (Photon and CLI resolve to the same
+#: toolset list), so refuse plainly here rather than accepting a silent no-op on
+#: a surface where the pick would be staged and never read. Telegram is absent
+#: deliberately: its Bot API only permits a fixed ~70-emoji reaction set, and an
+#: illegal one leaves the message with NO reaction — worse than the default.
+_CONSUMING_PLATFORMS = frozenset({"photon", "slack"})
 
 
 def set_reaction_tool(emoji: str) -> str:

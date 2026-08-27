@@ -106,3 +106,17 @@ def test_works_without_a_session_message_id(monkeypatch):
     pending_reactions.clear_all()
     assert _ok(srt.set_reaction_tool("🔧"))
     assert pending_reactions.pop_pending(pending_reactions.make_key(CHAT)) == "🔧"
+
+
+def test_accepts_slack(monkeypatch):
+    """Slack consumes staged picks too (translated to a shortcode by the adapter)."""
+    env = {
+        "HERMES_SESSION_PLATFORM": "slack",
+        "HERMES_SESSION_CHAT_ID": "D0BRN0WUXK5",
+    }
+    monkeypatch.setattr(srt, "get_session_env", lambda k, d="": env.get(k, d))
+    pending_reactions.clear_all()
+    assert _ok(srt.set_reaction_tool("🔧"))
+    assert pending_reactions.pop_pending(
+        pending_reactions.make_key("D0BRN0WUXK5")
+    ) == "🔧"

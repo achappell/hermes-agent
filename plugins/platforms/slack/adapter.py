@@ -4508,7 +4508,22 @@ class SlackAdapter(BasePlatformAdapter):
             return
         await self._remove_reaction(channel_id, ts, "eyes", team_id)
         if outcome == ProcessingOutcome.SUCCESS:
-            await self._add_reaction(channel_id, ts, "white_check_mark", team_id)
+            # LOCAL CARRY — not upstream. Context-aware completion reaction.
+            # The agent may have staged an emoji this turn via `set_reaction`;
+            # translate it to a Slack shortcode and use it in place of the
+            # generic white_check_mark. An unstaged or unmappable pick leaves
+            # `name` exactly as it was, so this can only ever match or improve
+            # on the previous behaviour -- never remove the reaction.
+            from gateway import pending_reactions
+            from gateway.reaction_emoji import to_slack_shortcode
+
+            name = "white_check_mark"
+            staged = pending_reactions.pop_pending(
+                pending_reactions.make_key(channel_id)
+            )
+            if staged:
+                name = to_slack_shortcode(staged) or name
+            await self._add_reaction(channel_id, ts, name, team_id)
         elif outcome == ProcessingOutcome.FAILURE:
             await self._add_reaction(channel_id, ts, "x", team_id)
 
