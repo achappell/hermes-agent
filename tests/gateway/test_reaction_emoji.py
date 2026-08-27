@@ -1,10 +1,8 @@
-"""Behaviour tests for the staged-emoji → platform translation table.
+"""Behaviour tests for the staged-emoji → Slack shortcode resolution.
 
-Slack's ``reactions.add`` takes a shortcode name, not the emoji character, so a
-staged 🔧 has to become ``"wrench"`` before it can land. Anything unmapped
-returns None, which the caller reads as "keep your existing default" — on Slack
-that default is ``white_check_mark``, so a gap degrades to the behaviour that
-shipped before this feature rather than to no reaction at all.
+Three layers: an override table for names Slack spells differently, a
+unicodedata-derived name for the long tail, and (in the caller) a fallback when
+Slack rejects the guess. These cover the first two.
 """
 from __future__ import annotations
 
@@ -13,53 +11,70 @@ import pytest
 from gateway.reaction_emoji import _SLACK_SHORTCODES, to_slack_shortcode
 
 
+def test_override_wins_where_slack_differs():
+    """🎉 derives as party_popper; Slack calls it tada."""
+    assert to_slack_shortcode("🎉") == "tada"
+    assert to_slack_shortcode("💥") == "boom"
+    assert to_slack_shortcode("☕") == "coffee"
+
+
+def test_derives_the_long_tail():
+    """The regression this rewrite exists for.
+
+    A hand table cannot keep up with a model choosing freely. 🧪 and 🤦 were
+    both picked in real turns and both fell through to the generic check.
+    """
+    assert to_slack_shortcode("🧪") == "test_tube"
+    assert to_slack_shortcode("🤦") == "face_palm"
+    assert to_slack_shortcode("🦑") == "squid"
+
+
 def test_maps_the_personas_vocabulary():
-    """Every emoji the persona names by hand must resolve."""
-    for emoji in ["🔧", "🎹", "⏰", "💥", "🎉", "☕", "🙄"]:
-        assert to_slack_shortcode(emoji), f"{emoji} has no Slack mapping"
-
-
-def test_maps_a_known_emoji():
-    assert to_slack_shortcode("🔧") == "wrench"
-
-
-def test_unmapped_emoji_returns_none():
-    """None is 'no opinion' — the caller keeps its default."""
-    assert to_slack_shortcode("🦑") is None
-
-
-def test_empty_returns_none():
-    assert to_slack_shortcode("") is None
+    for emoji in ["🔧", "🎹", "⏰", "💥", "🎉", "☕", "🙄", "🍽️"]:
+        assert to_slack_shortcode(emoji), f"{emoji} resolves to nothing"
 
 
 def test_variation_selector_is_normalised():
-    """❤️ is U+2764 + U+FE0F. Both spellings are the same reaction."""
     assert to_slack_shortcode("❤️") == "heart"
     assert to_slack_shortcode("❤") == "heart"
 
 
-def test_plate_with_cutlery_both_spellings():
-    """🍽️ is commonly typed with and without the variation selector."""
+def test_plate_uses_the_slack_spelling():
     assert to_slack_shortcode("🍽️") == "knife_fork_plate"
-    assert to_slack_shortcode("🍽") == "knife_fork_plate"
 
 
-def test_no_key_carries_a_variation_selector():
-    """Keys must be pre-normalised or the lookup silently misses."""
+def test_empty_returns_none():
+    assert to_slack_shortcode("") is None
+    assert to_slack_shortcode("\ufe0f") is None
+
+
+def test_non_emoji_returns_none():
+    """A space has no Unicode-derived reaction name worth sending."""
+    assert to_slack_shortcode(" ") is None
+
+
+def test_no_override_key_carries_a_variation_selector():
     for key in _SLACK_SHORTCODES:
-        assert "️" not in key, f"{key!r} still has U+FE0F"
+        assert "\ufe0f" not in key, f"{key!r} still has U+FE0F"
 
 
-def test_shortcodes_look_like_slack_names():
-    """Slack names are lowercase alphanumerics, underscores, + and -."""
-    import re
+def test_overrides_are_not_redundant():
+    """An override that matches the derived name is dead weight — and a lie.
+
+    The table's contract is 'only where Slack differs'. A redundant entry means
+    the next person cannot tell which entries are load-bearing.
+    """
+    from gateway.reaction_emoji import _derive_shortcode
 
     for emoji, name in _SLACK_SHORTCODES.items():
+        assert _derive_shortcode(emoji) != name, (
+            f"{emoji} -> {name!r} derives identically; remove the override"
+        )
+
+
+def test_results_look_like_slack_names():
+    import re
+
+    for emoji in ["🔧", "🧪", "🤦", "🎉", "❤️", "🍽️", "👍"]:
+        name = to_slack_shortcode(emoji)
         assert re.fullmatch(r"[a-z0-9_+-]+", name), f"{emoji} -> {name!r}"
-
-
-def test_defaults_round_trip():
-    """The emoji Slack already uses must map to the names it already sends."""
-    assert to_slack_shortcode("✅") == "white_check_mark"
-    assert to_slack_shortcode("❌") == "x"
-    assert to_slack_shortcode("👀") == "eyes"

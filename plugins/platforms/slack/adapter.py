@@ -4517,13 +4517,16 @@ class SlackAdapter(BasePlatformAdapter):
             from gateway import pending_reactions
             from gateway.reaction_emoji import to_slack_shortcode
 
-            name = "white_check_mark"
             staged = pending_reactions.pop_pending(
                 pending_reactions.make_key(channel_id)
             )
-            if staged:
-                name = to_slack_shortcode(staged) or name
-            await self._add_reaction(channel_id, ts, name, team_id)
+            name = to_slack_shortcode(staged) if staged else None
+            # A derived shortcode is a best guess; Slack rejects names its
+            # workspace does not know. reactions.add returns False on rejection,
+            # so fall back to the generic check rather than leaving the message
+            # with no reaction at all -- silently worse than not doing this.
+            if not (name and await self._add_reaction(channel_id, ts, name, team_id)):
+                await self._add_reaction(channel_id, ts, "white_check_mark", team_id)
         elif outcome == ProcessingOutcome.FAILURE:
             await self._add_reaction(channel_id, ts, "x", team_id)
 

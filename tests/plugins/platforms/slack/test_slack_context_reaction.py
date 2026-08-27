@@ -34,9 +34,12 @@ def adapter():
     a = SlackAdapter.__new__(SlackAdapter)
     calls: list[tuple] = []
 
+    # Slack rejects names the workspace does not know; the adapter must cope.
+    a.reject = set()
+
     async def fake_add(channel, timestamp, emoji, team_id=""):
         calls.append(("add", emoji))
-        return True
+        return emoji not in a.reject
 
     async def fake_remove(channel, timestamp, emoji, team_id=""):
         calls.append(("remove", emoji))
@@ -79,11 +82,25 @@ async def test_no_pick_keeps_the_check_mark(adapter):
 
 
 @pytest.mark.asyncio
-async def test_unmappable_emoji_falls_back_not_silent(adapter):
-    """A gap in the table must degrade to the old default, never to nothing."""
+async def test_long_tail_emoji_now_resolves(adapter):
+    """🧪 was picked in a real turn and fell through to the generic check."""
+    pending_reactions.set_pending(pending_reactions.make_key(CHANNEL), "🧪")
+    await adapter.on_processing_complete(_event(), ProcessingOutcome.SUCCESS)
+    assert _added(adapter) == ["test_tube"]
+
+
+@pytest.mark.asyncio
+async def test_rejected_shortcode_falls_back_to_the_check(adapter):
+    """The guard that makes a wrong guess harmless.
+
+    A derived name Slack does not recognise returns False from reactions.add.
+    Without this fallback the message would end up with NO reaction — strictly
+    worse than the generic one it used to get.
+    """
+    adapter.reject = {"squid"}
     pending_reactions.set_pending(pending_reactions.make_key(CHANNEL), "🦑")
     await adapter.on_processing_complete(_event(), ProcessingOutcome.SUCCESS)
-    assert _added(adapter) == ["white_check_mark"]
+    assert _added(adapter) == ["squid", "white_check_mark"]
 
 
 @pytest.mark.asyncio

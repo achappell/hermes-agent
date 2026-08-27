@@ -11,18 +11,24 @@ take the same thing:
 * Telegram — a fixed Bot API allowlist of ~70 emoji; anything else fails and
   leaves the message with no reaction at all. Not wired up yet.
 
-Every lookup that misses returns ``None`` so the caller can fall back to the
-platform's existing default. On Slack that default is ``white_check_mark``,
-i.e. exactly what shipped before this feature — a missing mapping degrades to
-current behaviour rather than to nothing.
+Slack resolution is three layers, because a hand-written table cannot keep up
+with a model choosing freely from all of Unicode:
 
-The table is deliberately hand-written and small: it covers the vocabulary the
-persona actually reaches for, plus the obvious neighbours. There is no ``emoji``
-package in this venv, and pulling one in to convert thirty strings would be a
-poor trade.
+1. ``_SLACK_SHORTCODES`` — only for emoji where Slack's name DIFFERS from the
+   Unicode name (🎉 is ``tada``, not ``party_popper``). Small on purpose.
+2. Otherwise derive from ``unicodedata.name()``. Slack's names track the
+   Unicode ones closely, so this covers the long tail for free: 🧪 →
+   ``test_tube``, 🤦 → ``face_palm``, 🦑 → ``squid``.
+3. The CALLER must treat a failed ``reactions.add`` as "wrong guess" and fall
+   back to its default. Layer 2 is a heuristic; without that guard a bad name
+   means NO reaction at all, which is worse than a generic one.
+
+There is no ``emoji`` package in this venv, and ``unicodedata`` is stdlib.
 """
 from __future__ import annotations
 
+import re
+import unicodedata
 from typing import Optional
 
 #: Variation selector-16. ❤️ is U+2764 + U+FE0F; the bare U+2764 is the same
@@ -30,61 +36,56 @@ from typing import Optional
 #: away before lookup instead of carrying two keys for every emoji.
 _VS16 = "️"
 
+#: ONLY emoji whose Slack name differs from the derived Unicode name. Anything
+#: that derives correctly must NOT be listed here — a redundant entry is one
+#: more thing to get wrong.
 _SLACK_SHORTCODES: dict[str, str] = {
-    # The persona's named vocabulary
-    "🔧": "wrench",
-    "🎹": "musical_keyboard",
-    "⏰": "alarm_clock",
-    "🍽": "knife_fork_plate",
-    "💥": "boom",
-    "🎉": "tada",
-    "☕": "coffee",
-    "🙄": "face_with_rolling_eyes",
-    # Work / debugging
-    "🔍": "mag",
-    "🐛": "bug",
-    "🚀": "rocket",
-    "📝": "memo",
-    "🧹": "broom",
-    "📦": "package",
-    "🗑": "wastebasket",
-    "⚡": "zap",
-    "💡": "bulb",
-    "🎯": "dart",
-    "🧠": "brain",
-    "🚨": "rotating_light",
-    "🔥": "fire",
-    "✨": "sparkles",
-    # Reactions proper
-    "👍": "+1",
-    "👎": "-1",
-    "✅": "white_check_mark",
-    "❌": "x",
-    "❤": "heart",
-    "😂": "joy",
-    "🤔": "thinking_face",
-    "🙈": "see_no_evil",
-    "👀": "eyes",
-    "🤯": "exploding_head",
-    "🥱": "yawning_face",
-    "💤": "zzz",
-    # Life
-    "🎂": "birthday",
-    "🌙": "crescent_moon",
-    "🎸": "guitar",
-    "🏆": "trophy",
-    "🍕": "pizza",
-    "🛒": "shopping_trolley",
-    "🩺": "stethoscope",
-    "📚": "books",
+    "🎉": "tada",              # party_popper
+    "💥": "boom",              # collision_symbol
+    "☕": "coffee",            # hot_beverage
+    "🍽": "knife_fork_plate",  # fork_and_knife_with_plate
+    "✅": "white_check_mark",  # white_heavy_check_mark
+    "❌": "x",                 # cross_mark
+    "👍": "+1",                # thumbs_up
+    "👎": "-1",                # thumbs_down
+    "❤": "heart",             # heavy_black_heart
+    "😂": "joy",               # face_with_tears_of_joy
+    "🔍": "mag",               # left_pointing_magnifying_glass
+    "⚡": "zap",               # high_voltage_sign
+    "💡": "bulb",              # electric_light_bulb
+    "🎯": "dart",              # direct_hit
+    "🚨": "rotating_light",    # police_cars_revolving_light
+    "🤯": "exploding_head",    # shocked_face_with_exploding_head
+    "💤": "zzz",               # sleeping_symbol
 }
 
 
-def to_slack_shortcode(emoji: str) -> Optional[str]:
-    """Return the Slack reaction name for ``emoji``, or None if unmapped.
 
-    None means "no opinion" — the caller keeps whatever it would have sent.
+def _derive_shortcode(emoji: str) -> Optional[str]:
+    """Slack-style name from the Unicode name, or None if there isn't one."""
+    if not emoji or emoji[0].isascii():
+        # ASCII has Unicode names too — " " is SPACE, "a" is LATIN SMALL
+        # LETTER A. Deriving a reaction name from those would send nonsense to
+        # Slack. Every emoji is non-ASCII, so this costs nothing real.
+        return None
+    try:
+        name = unicodedata.name(emoji[0])
+    except (ValueError, IndexError):
+        return None
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    return slug or None
+
+
+def to_slack_shortcode(emoji: str) -> Optional[str]:
+    """Return a best-effort Slack reaction name for ``emoji``, or None.
+
+    None means "no idea" — the caller keeps its default. A NON-None result is
+    still only a best guess for anything outside the override table, so the
+    caller must also handle ``reactions.add`` rejecting it.
     """
     if not emoji:
         return None
-    return _SLACK_SHORTCODES.get(emoji.replace(_VS16, ""))
+    bare = emoji.replace(_VS16, "")
+    if not bare:
+        return None
+    return _SLACK_SHORTCODES.get(bare) or _derive_shortcode(bare)
