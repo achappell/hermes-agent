@@ -4506,7 +4506,6 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = getattr(event.source, "chat_id", None)
         if not channel_id:
             return
-        await self._remove_reaction(channel_id, ts, "eyes", team_id)
         if outcome == ProcessingOutcome.SUCCESS:
             # LOCAL CARRY — not upstream. Context-aware completion reaction.
             # The agent may have staged an emoji this turn via `set_reaction`;
@@ -4521,6 +4520,13 @@ class SlackAdapter(BasePlatformAdapter):
                 pending_reactions.make_key(channel_id)
             )
             name = to_slack_shortcode(staged) if staged else None
+            # The agent may pick the SAME emoji the progress reaction uses. If
+            # we drop :eyes: and immediately re-add it Slack refuses the add,
+            # the fallback below fires, and the message ends up wearing both
+            # :eyes: and :white_check_mark:. Leave it in place instead.
+            if name == "eyes":
+                return
+            await self._remove_reaction(channel_id, ts, "eyes", team_id)
             # A derived shortcode is a best guess; Slack rejects names its
             # workspace does not know. reactions.add returns False on rejection,
             # so fall back to the generic check rather than leaving the message
@@ -4528,7 +4534,10 @@ class SlackAdapter(BasePlatformAdapter):
             if not (name and await self._add_reaction(channel_id, ts, name, team_id)):
                 await self._add_reaction(channel_id, ts, "white_check_mark", team_id)
         elif outcome == ProcessingOutcome.FAILURE:
+            await self._remove_reaction(channel_id, ts, "eyes", team_id)
             await self._add_reaction(channel_id, ts, "x", team_id)
+        else:
+            await self._remove_reaction(channel_id, ts, "eyes", team_id)
 
     # ----- User identity resolution -----
 

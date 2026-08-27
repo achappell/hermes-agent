@@ -133,3 +133,30 @@ async def test_reactions_disabled_stays_silent(adapter):
     pending_reactions.set_pending(pending_reactions.make_key(CHANNEL), "🔧")
     await adapter.on_processing_complete(_event(), ProcessingOutcome.SUCCESS)
     assert adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_picking_the_eyes_leaves_them_alone(adapter):
+    """The regression the screenshot caught.
+
+    👀 maps to `eyes`, the same reaction used for progress. Dropping it and
+    re-adding it made Slack refuse the add, the fallback fired, and the message
+    wore BOTH :eyes: and :white_check_mark:. Leave the existing one in place.
+    """
+    adapter.reject = {"eyes"}  # Slack refuses re-adding what is already there
+    pending_reactions.set_pending(pending_reactions.make_key(CHANNEL), "👀")
+    await adapter.on_processing_complete(_event(), ProcessingOutcome.SUCCESS)
+    assert adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_still_clears_the_eyes(adapter):
+    """A cancelled turn must not leave 👀 stuck on the message forever."""
+    await adapter.on_processing_complete(_event(), ProcessingOutcome.CANCELLED)
+    assert adapter.calls == [("remove", "eyes")]
+
+
+@pytest.mark.asyncio
+async def test_failure_still_clears_the_eyes(adapter):
+    await adapter.on_processing_complete(_event(), ProcessingOutcome.FAILURE)
+    assert adapter.calls == [("remove", "eyes"), ("add", "x")]
