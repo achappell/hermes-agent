@@ -204,9 +204,15 @@ def build_auto_tts_output_path(platform) -> str:
     provider, including MP3-only backends like Edge TTS. Everything else
     keeps the MP3 default.
     """
-    from tools.tts_tool import OPUS_VOICE_PLATFORMS
+    from tools.tts_tool import OPUS_VOICE_PLATFORMS, M4A_VOICE_PLATFORMS
 
-    ext = "ogg" if _platform_name(platform) in OPUS_VOICE_PLATFORMS else "mp3"
+    pname = _platform_name(platform)
+    if pname in M4A_VOICE_PLATFORMS:
+        ext = "m4a"          # iMessage voice notes (Photon / BlueBubbles)
+    elif pname in OPUS_VOICE_PLATFORMS:
+        ext = "ogg"
+    else:
+        ext = "mp3"
     audio_path = os.path.join(
         tempfile.gettempdir(),
         "hermes_voice",
@@ -214,6 +220,54 @@ def build_auto_tts_output_path(platform) -> str:
     )
     os.makedirs(os.path.dirname(audio_path), exist_ok=True)
     return audio_path
+
+
+# Rolling retention window for delivered auto-TTS voice notes. The gateway
+# traditionally deleted each voice note the moment it was sent; Amanda wanted
+# a week of them back (Aug 2026). Files are moved here instead of deleted, and
+# anything older than _VOICE_NOTE_RETENTION_DAYS is swept on each retain.
+_VOICE_NOTE_RETENTION_DAYS = 7
+_VOICE_NOTE_RETENTION_GLOB = "tts_reply_*.m4a"
+
+
+def _retain_voice_note(path: str) -> None:
+    """Move a delivered auto-TTS voice note into the week archive.
+
+    Best-effort and intentionally failure-tolerant: a retention problem must
+    never break reply delivery, so on any unexpected error we fall back to
+    deleting the temp file (old behaviour). Files already in the archive are
+    left untouched; each call sweeps notes older than retention days.
+    """
+    try:
+        import shutil
+
+        archive_dir = _HERMES_HOME / "cache" / "audio" / "voice_retained"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        src = os.path.abspath(path)
+        tgt = archive_dir / os.path.basename(path)
+        if os.path.abspath(src) != os.path.abspath(str(tgt)):
+            try:
+                os.replace(src, str(tgt))
+            except OSError:
+                shutil.copy2(src, str(tgt))
+                try:
+                    os.remove(src)
+                except OSError:
+                    pass
+        cutoff = time.time() - _VOICE_NOTE_RETENTION_DAYS * 86400
+        for f in archive_dir.iterdir():
+            try:
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except OSError:
+                pass
+    except Exception:
+        # Retention is best-effort; never let it break delivery. Restore old
+        # delete-after-deliver so the temp path doesn't leak.
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def utf16_len(s: str) -> int:
@@ -6667,16 +6721,10 @@ class BasePlatformAdapter(ABC):
                             )
                         )
                     finally:
-                        try:
-                            os.remove(_tts_path)
-                        except OSError:
-                            pass
+                        _retain_voice_note(_tts_path)
                 if not _tts_paths and _tts_cleanup_paths:
                     for _cleanup_path in _tts_cleanup_paths:
-                        try:
-                            os.remove(_cleanup_path)
-                        except OSError:
-                            pass
+                        _retain_voice_note(_cleanup_path)
 
                 # Send the text portion. A reconnect may have replaced this
                 # adapter while its in-flight handler was still producing a
