@@ -48,6 +48,13 @@ def _looks_like_one_emoji(value: str) -> bool:
 #: illegal one leaves the message with NO reaction — worse than the default.
 _CONSUMING_PLATFORMS = frozenset({"photon", "slack"})
 
+#: The emoji already used to mean "working on it". Picking it as the FINAL
+#: reaction is indistinguishable from the turn never finishing — the bubble
+#: looks unchanged and the user reads it as broken. Observed three times in a
+#: row on Slack, so refuse it here and let the model choose again rather than
+#: silently swapping in something it did not ask for.
+_PROGRESS_EMOJI = "\U0001f440"
+
 
 def set_reaction_tool(emoji: str) -> str:
     """Stage ``emoji`` as this turn's completion tapback."""
@@ -64,6 +71,13 @@ def set_reaction_tool(emoji: str) -> str:
     if not key:
         return tool_error(
             "No chat to react in on this surface."
+        )
+
+    if emoji.replace("\ufe0f", "") == _PROGRESS_EMOJI:
+        return tool_error(
+            "👀 already means 'still working' — it's the reaction that's "
+            "showing right now. Pick something that says what the turn was "
+            "about instead."
         )
 
     if emoji and not _looks_like_one_emoji(emoji):
@@ -96,6 +110,8 @@ SET_REACTION_SCHEMA = {
         "🔧 for a config you fixed, 🎹 for practice notes, ⏰ for a reminder, "
         "🍽️ for anything about food, 💥 when something broke, 🎉 when it "
         "finally worked, ☕ at 1am, 🙄 for the third time the same API failed. "
+        "NOT 👀 — that already means 'still working' and is showing on the "
+        "message right now; reusing it looks like nothing happened. "
         "Match the content, not the outcome — 'it succeeded' is what 👍 already "
         "said, and it said it badly. NEVER mention that you reacted or explain "
         "the choice: the emoji appearing on the bubble is the entire point, and "

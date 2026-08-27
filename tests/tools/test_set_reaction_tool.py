@@ -120,3 +120,21 @@ def test_accepts_slack(monkeypatch):
     assert pending_reactions.pop_pending(
         pending_reactions.make_key("D0BRN0WUXK5")
     ) == "🔧"
+
+
+def test_refuses_the_progress_emoji(photon_session):
+    """The regression that read as 'it did not react'.
+
+    👀 is the in-progress reaction. Staged as the FINAL one it leaves the
+    bubble looking untouched — indistinguishable from a turn that never
+    finished. The model picked it three times running, so refuse it and let it
+    choose again rather than staging something that cannot show.
+    """
+    raw = srt.set_reaction_tool("👀")
+    assert "already means" in raw
+    assert pending_reactions.pop_pending(pending_reactions.make_key(CHAT)) is None
+
+
+def test_refuses_the_progress_emoji_with_variation_selector(photon_session):
+    srt.set_reaction_tool("👀\ufe0f")
+    assert pending_reactions.pop_pending(pending_reactions.make_key(CHAT)) is None
