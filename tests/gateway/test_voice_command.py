@@ -1410,8 +1410,17 @@ class TestSendVoiceReplyCleanup:
 class TestAutoTtsTempFileCleanup:
     """Base adapter auto-TTS must clean up generated audio file."""
 
-    def test_source_has_finally_remove(self):
-        """play_tts call is wrapped in try/finally with os.remove."""
+    def test_source_has_finally_cleanup(self):
+        """play_tts call is wrapped in try/finally that disposes of the temp file.
+
+        LOCAL CARRY: upstream deletes the file outright with ``os.remove``. The
+        m4a/voice-retention commit replaces that with ``_retain_voice_note``,
+        which MOVES the note into a 7-day archive (and falls back to os.remove
+        internally on any failure). Either disposal satisfies the property this
+        test exists to protect -- that the temp file never leaks -- so accept
+        both rather than leaving a permanently red test that would mask a real
+        regression here later.
+        """
         import inspect
         from gateway.platforms.base import BasePlatformAdapter
         source = inspect.getsource(BasePlatformAdapter._process_message_background)
@@ -1420,10 +1429,17 @@ class TestAutoTtsTempFileCleanup:
         assert play_tts_idx > 0
         after_play = source[play_tts_idx:]
         finally_idx = after_play.find("finally")
-        remove_idx = after_play.find("os.remove")
         assert finally_idx > 0, "play_tts must be in a try/finally block"
-        assert remove_idx > 0, "finally block must call os.remove on _tts_path"
-        assert remove_idx > finally_idx, "os.remove must be inside the finally block"
+        disposals = [
+            idx
+            for idx in (
+                after_play.find("os.remove"),
+                after_play.find("_retain_voice_note"),
+            )
+            if idx > 0
+        ]
+        assert disposals, "finally block must dispose of _tts_path"
+        assert max(disposals) > finally_idx, "disposal must be inside the finally block"
 
 
 # =====================================================================
