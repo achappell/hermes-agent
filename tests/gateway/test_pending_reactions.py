@@ -66,31 +66,15 @@ def test_blank_key_is_ignored():
     assert pr.pop_pending("") is None
 
 
-def test_make_key_needs_both_halves():
-    """A half-known message is not a key — it would collide across chats."""
-    assert pr.make_key("chat", "msg")
-    assert pr.make_key("chat", "") == ""
-    assert pr.make_key("", "msg") == ""
+def test_make_key_needs_a_chat():
+    """No chat means no address — must not produce a usable global key."""
+    assert pr.make_key("any;-;+15551234")
+    assert pr.make_key("") == ""
 
 
-def test_make_key_is_unambiguous():
-    """Chat and message ids are separated so they cannot run together.
-
-    Photon chat ids look like ``any;-;+15551234`` — punctuation-heavy — so the
-    separator must be something they cannot contain.
-    """
-    a = pr.make_key("any;-;+1555", "12")
-    b = pr.make_key("any;-;+15551", "2")
-    assert a != b
-
-
-def test_key_binds_the_pick_to_one_message():
-    """Two turns in the SAME chat must not inherit each other's emoji."""
-    first = pr.make_key("chat-1", "msg-1")
-    second = pr.make_key("chat-1", "msg-2")
-    pr.set_pending(first, "🔧")
-    assert pr.pop_pending(second) is None
-    assert pr.pop_pending(first) == "🔧"
+def test_make_key_distinguishes_chats():
+    """Photon chat ids are punctuation-heavy; they must not collide."""
+    assert pr.make_key("any;-;+1555") != pr.make_key("any;-;+15551")
 
 
 def test_mailbox_is_bounded():

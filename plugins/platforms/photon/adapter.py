@@ -2393,9 +2393,7 @@ class PhotonAdapter(BasePlatformAdapter):
 
         chat_id = getattr(event.source, "chat_id", "") or ""
         message_id = getattr(event, "message_id", "") or ""
-        chosen = pending_reactions.pop_pending(
-            pending_reactions.make_key(chat_id, message_id)
-        )
+        chosen = pending_reactions.pop_pending(pending_reactions.make_key(chat_id))
 
         if (
             not chosen

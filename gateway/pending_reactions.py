@@ -13,11 +13,10 @@ Flow, all inside one gateway process::
     turn completes  adapter hook        ->  pop_pending(session_key) -> "🔧"
                                             (None -> fall back to 👍)
 
-Keyed by ``(chat_id, message_id)`` — the message being reacted to. Both sides
-derive that key without coordinating: the tool from ``HERMES_SESSION_CHAT_ID``
-/ ``HERMES_SESSION_MESSAGE_ID``, the adapter from ``event.source.chat_id`` /
-``event.message_id``. Binding the pick to a message rather than a session makes
-it structurally impossible to leak into a later turn or a parallel chat.
+Keyed by ``chat_id``. Both sides derive that without coordinating: the tool
+from ``HERMES_SESSION_CHAT_ID``, the adapter from ``event.source.chat_id``.
+``pop_pending`` is one-shot, so a pick cannot leak into a later turn, and
+separate chats cannot see each other's.
 
 Bounded because a gateway runs for weeks: the dict is insertion-ordered and the
 oldest entries are evicted first, matching the ``_sent_message_ids`` pattern
@@ -38,15 +37,21 @@ _pending: Dict[str, str] = {}
 _lock = threading.Lock()
 
 
-def make_key(chat_id: str, message_id: str) -> str:
-    """Build the mailbox key for a message, or "" when either half is missing.
+def make_key(chat_id: str) -> str:
+    """Build the mailbox key for a chat, or "" when there is no chat.
 
-    Both callers go through this so the tool and the adapter cannot drift into
-    formatting the key two different ways.
+    Keyed by CHAT, not by message. Photon sets ``message_id`` on the
+    MessageEvent but never on the MessageSource, and the gateway populates
+    ``HERMES_SESSION_MESSAGE_ID`` from ``context.source.message_id`` — so the
+    tool side always saw an empty message id and could never build a key.
+
+    Chat-scoped matches what this adapter already does natively:
+    ``PhotonAdapter.add_reaction`` defaults to "the chat's most recent inbound
+    message". A turn is answering that message, so the chat is a sufficient
+    address. ``pop_pending`` stays one-shot, so a pick still cannot survive
+    into a later turn.
     """
-    if not chat_id or not message_id:
-        return ""
-    return f"{chat_id}\x1f{message_id}"
+    return chat_id or ""
 
 
 def set_pending(key: str, emoji: str) -> None:

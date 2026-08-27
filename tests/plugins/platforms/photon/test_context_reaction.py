@@ -58,7 +58,7 @@ def _added(adapter):
 
 @pytest.mark.asyncio
 async def test_uses_the_agents_emoji_on_success(adapter):
-    pending_reactions.set_pending(pending_reactions.make_key(CHAT, MSG), "🔧")
+    pending_reactions.set_pending(pending_reactions.make_key(CHAT), "🔧")
     await adapter.on_processing_complete(_event(), ProcessingOutcome.SUCCESS)
     assert _added(adapter) == ["🔧"]
 
@@ -66,7 +66,7 @@ async def test_uses_the_agents_emoji_on_success(adapter):
 @pytest.mark.asyncio
 async def test_removes_the_watching_eyes_first(adapter):
     """The 👀 must come off before the new tapback goes on."""
-    pending_reactions.set_pending(pending_reactions.make_key(CHAT, MSG), "🔧")
+    pending_reactions.set_pending(pending_reactions.make_key(CHAT), "🔧")
     await adapter.on_processing_complete(_event(), ProcessingOutcome.SUCCESS)
     assert [c[0] for c in adapter.calls] == ["remove", "add"]
 
@@ -81,7 +81,7 @@ async def test_falls_back_to_thumbs_up_when_agent_did_not_choose(adapter):
 @pytest.mark.asyncio
 async def test_failure_ignores_the_agents_emoji(adapter):
     """A cheerful emoji on a crashed turn would be a lie — 👎 wins."""
-    pending_reactions.set_pending(pending_reactions.make_key(CHAT, MSG), "🎉")
+    pending_reactions.set_pending(pending_reactions.make_key(CHAT), "🎉")
     await adapter.on_processing_complete(_event(), ProcessingOutcome.FAILURE)
     assert _added(adapter) == [PhotonAdapter._FAIL_EMOJI]
 
@@ -89,7 +89,7 @@ async def test_failure_ignores_the_agents_emoji(adapter):
 @pytest.mark.asyncio
 async def test_pick_is_consumed_not_reused(adapter):
     """The next turn in the same chat must start from the default again."""
-    pending_reactions.set_pending(pending_reactions.make_key(CHAT, MSG), "🔧")
+    pending_reactions.set_pending(pending_reactions.make_key(CHAT), "🔧")
     await adapter.on_processing_complete(_event(), ProcessingOutcome.SUCCESS)
     adapter.calls.clear()
     await adapter.on_processing_complete(_event(), ProcessingOutcome.SUCCESS)
@@ -97,12 +97,10 @@ async def test_pick_is_consumed_not_reused(adapter):
 
 
 @pytest.mark.asyncio
-async def test_pick_does_not_leak_to_another_message(adapter):
-    """A pick staged for one message must not land on a different one."""
-    pending_reactions.set_pending(pending_reactions.make_key(CHAT, "msg-1"), "🔧")
-    await adapter.on_processing_complete(
-        _event(message_id="msg-2"), ProcessingOutcome.SUCCESS
-    )
+async def test_pick_does_not_leak_to_another_chat(adapter):
+    """A pick staged in one chat must never land in a different one."""
+    pending_reactions.set_pending(pending_reactions.make_key("other-chat"), "🔧")
+    await adapter.on_processing_complete(_event(), ProcessingOutcome.SUCCESS)
     assert _added(adapter) == [PhotonAdapter._OK_EMOJI]
 
 
@@ -110,13 +108,13 @@ async def test_pick_does_not_leak_to_another_message(adapter):
 async def test_reactions_disabled_stays_silent(adapter):
     """With PHOTON_REACTIONS off the adapter must not tapback at all."""
     adapter._reactions_enabled = lambda: False
-    pending_reactions.set_pending(pending_reactions.make_key(CHAT, MSG), "🔧")
+    pending_reactions.set_pending(pending_reactions.make_key(CHAT), "🔧")
     await adapter.on_processing_complete(_event(), ProcessingOutcome.SUCCESS)
     assert adapter.calls == []
 
 
 @pytest.mark.asyncio
 async def test_cancelled_leaves_the_message_unreacted(adapter):
-    pending_reactions.set_pending(pending_reactions.make_key(CHAT, MSG), "🔧")
+    pending_reactions.set_pending(pending_reactions.make_key(CHAT), "🔧")
     await adapter.on_processing_complete(_event(), ProcessingOutcome.CANCELLED)
     assert _added(adapter) == []

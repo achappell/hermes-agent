@@ -58,13 +58,10 @@ def set_reaction_tool(emoji: str) -> str:
             "this only does anything on iMessage (Photon)."
         )
 
-    key = pending_reactions.make_key(
-        get_session_env("HERMES_SESSION_CHAT_ID", ""),
-        get_session_env("HERMES_SESSION_MESSAGE_ID", ""),
-    )
+    key = pending_reactions.make_key(get_session_env("HERMES_SESSION_CHAT_ID", ""))
     if not key:
         return tool_error(
-            "No message to react to on this surface."
+            "No chat to react in on this surface."
         )
 
     if emoji and not _looks_like_one_emoji(emoji):
