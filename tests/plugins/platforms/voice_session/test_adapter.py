@@ -110,6 +110,7 @@ async def test_text_draft_and_final_close_a_turn(monkeypatch):
         "text_final",
         "turn_end",
     ]
+    assert websocket.json_frames[1]["replace"] is True
 
 
 @pytest.mark.asyncio
@@ -162,3 +163,44 @@ async def test_late_pcm_after_abort_is_dropped(monkeypatch):
         "audio_start",
         "audio_abort",
     ]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_cursor_suppresses_duplicate_turn(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    adapter.handle_message = _noop_handle_message
+    first_ws = FakeWebSocket()
+    first = await adapter._accept_hello(
+        first_ws,
+        {
+            "type": "hello",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_id": "amanda-laptop",
+            "device_id": "macbook",
+            "session_id": "default",
+        },
+    )
+    await adapter._handle_turn(
+        first, {"type": "turn", "turn_id": "retry-me", "text": "hello"}
+    )
+
+    second_ws = FakeWebSocket()
+    second = await adapter._accept_hello(
+        second_ws,
+        {
+            "type": "hello",
+            "protocol_version": PROTOCOL_VERSION,
+            "client_id": "amanda-laptop",
+            "device_id": "macbook",
+            "session_id": "default",
+            "last_turn_id": "retry-me",
+        },
+    )
+    assert second.resume_turn_id == "retry-me"
+    assert "retry-me" in second.recent_turns
+
+    await adapter._handle_turn(
+        second, {"type": "turn", "turn_id": "retry-me", "text": "hello again"}
+    )
+    assert second_ws.json_frames[-1]["type"] == "turn_duplicate"
+    assert len(second_ws.json_frames) == 1

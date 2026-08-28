@@ -135,6 +135,8 @@ class _Connection:
     closed: bool = False
     recent_turns: Set[str] = field(default_factory=set)
     recent_turn_order: list[str] = field(default_factory=list)
+    last_draft_text: str = ""
+    resume_turn_id: Optional[str] = None
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -188,6 +190,10 @@ class VoiceSessionAdapter(BasePlatformAdapter):
         # One live socket per authenticated physical device.  The session id
         # is a thread/session lane inside that device connection.
         self._connections: Dict[str, _Connection] = {}
+        # Retain a bounded turn cursor across reconnects.  This lets a client
+        # safely retry a turn without causing a second agent run.
+        self._recent_turns_by_chat: Dict[str, Set[str]] = {}
+        self._recent_turn_order_by_chat: Dict[str, list[str]] = {}
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -318,6 +324,13 @@ class VoiceSessionAdapter(BasePlatformAdapter):
                     "session_id": connection.session_id,
                     "chat_id": connection.chat_id,
                     "capabilities": ["text_stream", "pcm_s16le", "interrupt"],
+                    "resume": {
+                        "requested_turn_id": connection.resume_turn_id,
+                        "known": bool(
+                            connection.resume_turn_id
+                            and connection.resume_turn_id in connection.recent_turns
+                        ),
+                    },
                 },
             )
 
@@ -364,7 +377,13 @@ class VoiceSessionAdapter(BasePlatformAdapter):
         if payload.get("type") != "hello":
             raise ValueError("first message must be hello")
         version = payload.get("protocol_version")
-        if isinstance(version, bool) or int(version or 0) != PROTOCOL_VERSION:
+        try:
+            parsed_version = int(version)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"unsupported protocol_version (expected {PROTOCOL_VERSION})"
+            ) from exc
+        if isinstance(version, bool) or parsed_version != PROTOCOL_VERSION:
             raise ValueError(
                 f"unsupported protocol_version (expected {PROTOCOL_VERSION})"
             )
@@ -372,6 +391,9 @@ class VoiceSessionAdapter(BasePlatformAdapter):
         client_id = _safe_id(payload.get("client_id"), "client_id")
         device_id = _safe_id(payload.get("device_id") or client_id, "device_id")
         session_id = _safe_id(payload.get("session_id") or "default", "session_id")
+        resume_turn_id = _safe_id(
+            payload.get("last_turn_id"), "last_turn_id", required=False
+        )
         display_name = str(payload.get("display_name") or "").strip()[
             :MAX_DISPLAY_NAME_CHARS
         ]
@@ -382,6 +404,8 @@ class VoiceSessionAdapter(BasePlatformAdapter):
         old = self._connections.get(chat_id)
         if old is not None and old.websocket is not websocket:
             await self._close_connection(old)
+        recent_turns = self._recent_turns_by_chat.setdefault(chat_id, set())
+        recent_turn_order = self._recent_turn_order_by_chat.setdefault(chat_id, [])
         connection = _Connection(
             websocket=websocket,
             chat_id=chat_id,
@@ -389,6 +413,9 @@ class VoiceSessionAdapter(BasePlatformAdapter):
             device_id=device_id,
             session_id=session_id,
             display_name=display_name,
+            recent_turns=recent_turns,
+            recent_turn_order=recent_turn_order,
+            resume_turn_id=resume_turn_id,
         )
         self._connections[chat_id] = connection
         return connection
@@ -434,6 +461,7 @@ class VoiceSessionAdapter(BasePlatformAdapter):
                     "type": "turn_duplicate",
                     "turn_id": turn_id,
                     "session_id": connection.session_id,
+                    "reason": "already_processed",
                 },
             )
             return
@@ -453,6 +481,7 @@ class VoiceSessionAdapter(BasePlatformAdapter):
         connection.turn_end_sent = False
         connection.interrupted = False
         connection.active_tts = None
+        connection.last_draft_text = ""
         connection.recent_turns.add(turn_id)
         connection.recent_turn_order.append(turn_id)
         while len(connection.recent_turn_order) > MAX_RECENT_TURNS:
@@ -626,12 +655,18 @@ class VoiceSessionAdapter(BasePlatformAdapter):
                 error="voice-session device is not connected",
                 retryable=True,
             )
+        preview = str(content or "")
+        connection.last_draft_text = preview
         ok = await self._send_json(
             connection,
             {
                 "type": "text_delta",
                 "draft_id": int(draft_id),
-                "text": str(content or ""),
+                # BasePlatformAdapter.send_draft receives the accumulated
+                # preview, not a token delta.  ``replace`` makes that wire
+                # contract explicit to clients and prevents repeated output.
+                "text": preview,
+                "replace": True,
                 "turn_id": connection.current_turn_id,
                 "session_id": connection.session_id,
             },
@@ -712,6 +747,10 @@ class VoiceSessionAdapter(BasePlatformAdapter):
                 "channels": int(audio_format.channels),
                 "sample_width": int(audio_format.sample_width),
                 "encoding": "pcm_s16le",
+                # A device client should stop any prior response before
+                # playing this stream; the server permits one active stream
+                # per device connection.
+                "audio_focus": "exclusive",
             },
         )
         if not ok:

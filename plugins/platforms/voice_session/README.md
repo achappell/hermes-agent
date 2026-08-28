@@ -34,7 +34,7 @@ The client supplies `Authorization: Bearer <VOICE_SESSION_TOKEN>` on the
 WebSocket upgrade, then sends:
 
 ```json
-{"type":"hello","protocol_version":1,"client_id":"amanda-laptop","device_id":"macbook","session_id":"default"}
+{"type":"hello","protocol_version":1,"client_id":"amanda-laptop","device_id":"macbook","session_id":"default","last_turn_id":"turn-0"}
 ```
 
 For each locally recognized utterance:
@@ -50,8 +50,15 @@ is deliberately not part of v1; microphone capture and STT stay on the client.
 Server messages are JSON (`hello_ack`, `turn_accepted`, `text_delta`, `text`,
 `text_final`, `status`, `audio_start`, `audio_end`, `turn_end`, `error`, and
 interrupt events) interleaved with binary raw little-endian PCM frames. The
-`audio_start` message declares sample rate, channels, and sample width; binary
-frames belong to that audio stream until `audio_end`.
+`text_delta` payload is the accumulated draft preview and carries
+`replace: true`; clients should replace their preview (or append only the new
+suffix), not print the whole payload as a token delta. The `audio_start`
+message declares sample rate, channels, sample width, and an `exclusive`
+audio-focus hint; binary frames belong to that audio stream until `audio_end`.
 
 The stream is single-turn per device connection. Reconnects may reuse the same
-`session_id` so Hermes' normal session history remains stable.
+`session_id` so Hermes' normal session history remains stable. A reconnect may
+include `last_turn_id`; the server reports whether that cursor is known and
+suppresses a duplicate retry for a recently accepted turn. Protocol v1 does
+not replay the old response, so the client should retry only when it did not
+receive `turn_accepted`.

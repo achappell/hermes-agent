@@ -111,6 +111,7 @@ async def _run(args: argparse.Namespace) -> int:
             audio: bytearray = bytearray()
             audio_format: Optional[tuple[int, int, int]] = None
             streamed_text = False
+            rendered_preview = ""
             print("hermes: ", end="", flush=True)
             while True:
                 frame = await ws.recv()
@@ -122,13 +123,26 @@ async def _run(args: argparse.Namespace) -> int:
                 if kind == "turn_accepted":
                     continue
                 if kind == "text_delta":
+                    preview = str(payload.get("text") or "")
+                    if preview.startswith(rendered_preview):
+                        print(preview[len(rendered_preview) :], end="", flush=True)
+                    else:
+                        # Tool-status lines or a cursor can replace the
+                        # accumulated prefix. Keep the terminal readable
+                        # instead of printing the whole preview twice.
+                        print(f"\n{preview}", end="", flush=True)
+                    rendered_preview = preview
                     streamed_text = True
-                    print(payload.get("text", ""), end="", flush=True)
                 elif kind in {"text", "text_final"}:
+                    final_text = str(payload.get("text") or "")
                     if kind == "text_final" and not streamed_text:
-                        print(payload.get("text", ""), end="", flush=True)
+                        print(final_text, end="", flush=True)
+                    elif kind == "text_final" and final_text != rendered_preview.rstrip(
+                        "▉"
+                    ):
+                        print(f"\n{final_text}", end="", flush=True)
                     elif kind == "text":
-                        print(payload.get("text", ""), end="", flush=True)
+                        print(final_text, end="", flush=True)
                 elif kind == "audio_start":
                     audio_format = (
                         int(payload.get("sample_rate", 24000)),
