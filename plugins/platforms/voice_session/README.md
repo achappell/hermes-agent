@@ -28,6 +28,36 @@ When enabled, the listener exposes:
 * `GET /voice-session/health` — unauthenticated readiness probe.
 * `GET /voice-session` — authenticated WebSocket session.
 
+## Laptop microphone POC
+
+Run `scripts/voice-session-client.py` on the laptop that has the microphone.
+Install the optional local audio/STT dependencies in that Hermes checkout first:
+
+```bash
+uv sync --extra voice
+```
+
+Then capture one turn:
+
+```bash
+VOICE_SESSION_TOKEN='…' \
+  scripts/voice-session-client.py \
+  --url ws://<media-server-address>:8790/voice-session \
+  --microphone --once
+```
+
+Without `--once`, the client returns to a listening prompt for another turn.
+The recorder ends an utterance after the configured silence duration and has a
+hard cap; tune those boundaries with `--mic-silence-duration` and
+`--mic-max-seconds`. `--stt-model` overrides `stt.local.model` for that run.
+
+The microphone audio is recorded and transcribed locally through Hermes'
+existing Faster-Whisper pipeline. Only the resulting transcript crosses the
+WebSocket; v1 deliberately has no binary microphone-ingress path. Response
+audio is still written to a WAV file by this POC rather than played locally.
+Keep the token in the environment (or another secret store), never in this
+README or a shell-history-friendly command you plan to commit.
+
 ## Protocol v1
 
 The client supplies `Authorization: Bearer <VOICE_SESSION_TOKEN>` on the
