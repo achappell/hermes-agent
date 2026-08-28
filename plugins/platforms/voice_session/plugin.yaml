@@ -1,0 +1,41 @@
+name: voice-session-platform
+label: Voice session
+kind: platform
+version: 0.1.0
+description: >
+  Authenticated WebSocket voice-session channel for Hermes Agent. Clients send
+  local-STT transcripts and receive streamed text plus raw PCM audio through
+  the normal platform adapter and gateway session boundary.
+author: Hermes Agent contributors
+requires_env:
+  - name: VOICE_SESSION_TOKEN
+    description: "Bearer token required on every voice-session WebSocket upgrade"
+    prompt: "Voice-session bearer token"
+    password: true
+optional_env:
+  - name: VOICE_SESSION_HOST
+    description: "Listener bind host (default: 127.0.0.1)"
+    prompt: "Voice-session host"
+    password: false
+  - name: VOICE_SESSION_PORT
+    description: "Listener port (default: 8790)"
+    prompt: "Voice-session port"
+    password: false
+  - name: VOICE_SESSION_PATH
+    description: "WebSocket path (default: /voice-session)"
+    prompt: "Voice-session path"
+    password: false
+  - name: VOICE_SESSION_ALLOWED_USERS
+    description: "Comma-separated client IDs allowed after token authentication"
+    prompt: "Allowed client IDs (comma-separated)"
+    password: false
+  - name: VOICE_SESSION_ALLOW_ALL_USERS
+    description: "Allow any authenticated client ID (development only)"
+    prompt: "Allow all clients? (true/false)"
+    password: false
+  - name: VOICE_SESSION_HELLO_TIMEOUT
+    description: "Seconds a WebSocket may wait before sending hello (default: 5)"
+    prompt: "Hello timeout"
+    password: false
+python_dependencies:
+  - aiohttp
