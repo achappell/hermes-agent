@@ -221,7 +221,7 @@ class StreamingTTSConsumer:
             with contextlib.suppress(Exception):
                 self._loop.call_soon_threadsafe(asyncio.create_task, self._safe_abort(reason))
 
-    async def wait_complete(self, timeout: float = 10.0) -> bool:
+    async def wait_complete(self, timeout: float = 60.0) -> bool:
         """Wait for the drain task to finish. Returns True only on full success."""
         if self._task is not None:
             with contextlib.suppress(asyncio.CancelledError, Exception):

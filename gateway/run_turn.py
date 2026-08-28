@@ -3269,7 +3269,10 @@ class GatewayTurnMixin:
             return
         _stts.finish()
         try:
-            await _stts.wait_complete(timeout=10.0)
+            from gateway.run import _streaming_tts_finalization_timeout
+            from tools.tts_tool import _load_tts_config
+            _stts_timeout = _streaming_tts_finalization_timeout(_load_tts_config())
+            await _stts.wait_complete(timeout=_stts_timeout)
         except Exception as _stts_done_err:
             logger.debug("streaming TTS wait_complete error: %s", _stts_done_err)
         if not _stts.done:
