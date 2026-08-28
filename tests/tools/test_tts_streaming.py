@@ -158,6 +158,67 @@ def test_openai_streamer_prefers_configured_api_key(monkeypatch):
 # ── Dispatch: chunked streamer path ──────────────────────────────────────
 
 
+
+def test_qwen_streamer_uses_chunked_endpoint_and_aligns_pcm(monkeypatch):
+    import types
+
+    captured = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def raise_for_status(self):
+            captured["status_checked"] = True
+
+        def iter_content(self, chunk_size):
+            captured["chunk_size"] = chunk_size
+            yield b"\x01"
+            yield b"\x00\x02\x00"
+
+    def _post(url, **kwargs):
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return _Response()
+
+    monkeypatch.setitem(sys.modules, "requests", types.SimpleNamespace(post=_post))
+    config = {
+        "provider": "openai",
+        "streaming": {"provider": "qwen"},
+        "qwen": {
+            "base_url": "http://queen:8767/v1",
+            "model": "qwen3-tts-streaming",
+            "voice": "capaldi-calm",
+            "language": "English",
+            "api_key": "local-qwen",
+        },
+    }
+
+    streamer = ts.resolve_streaming_provider(config)
+    assert isinstance(streamer, ts.QwenStreamer)
+    assert list(streamer.stream("Streaming adapter test.")) == [
+        b"\x01\x00\x02\x00"
+    ]
+    assert captured["url"] == "http://queen:8767/v1/audio/speech/stream"
+    assert captured["kwargs"]["stream"] is True
+    assert captured["kwargs"]["json"]["voice"] == "capaldi-calm"
+    assert captured["kwargs"]["json"]["language"] == "English"
+    assert captured["kwargs"]["json"]["response_format"] == "pcm"
+    assert captured["kwargs"]["headers"]["Authorization"] == "Bearer local-qwen"
+    assert captured["status_checked"] is True
+    assert captured["chunk_size"] == 8192
+
+
+def test_qwen_streamer_requires_an_endpoint():
+    assert ts.resolve_streaming_provider(
+        {"streaming": {"provider": "qwen"}}
+    ) is None
+
+
+
 def _drain_queue(sentences):
     q = queue.Queue()
     for s in sentences:

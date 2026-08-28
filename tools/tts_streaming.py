@@ -144,6 +144,10 @@ class StreamingTTSProvider(ABC):
     def available() -> bool:
         """True when this provider's credentials/SDK are usable right now."""
 
+    def is_ready(self) -> bool:
+        """Return whether this configured instance has a usable endpoint."""
+        return True
+
     @abstractmethod
     def stream(self, text: str) -> Iterator[bytes]:
         """Yield PCM chunks for ``text``. Raise on failure (caller logs)."""
@@ -165,8 +169,14 @@ def _try_instantiate(name: str, tts_config: Dict) -> Optional[StreamingTTSProvid
     cls = _REGISTRY.get(name)
     if cls is None or not cls.available():
         return None
+    section = tts_config.get(name) or {}
+    if not isinstance(section, dict):
+        section = {}
     try:
-        return cls(tts_config, tts_config.get(name) or {})
+        instance = cls(tts_config, section)
+        if not instance.is_ready():
+            return None
+        return instance
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("streaming provider %s init failed: %s", name, exc)
         return None
@@ -200,6 +210,11 @@ def resolve_streaming_provider(
     """
     streaming_cfg = tts_config.get("streaming") or {}
     pinned = str(streaming_cfg.get("provider") or "").lower().strip()
+    # Explicitly disabling streaming must not fall through to the configured
+    # provider. This lets a profile choose the complete Qwen route when its
+    # experimental chunked route has less consistent prosody.
+    if pinned in {"none", "off", "disabled", "false"}:
+        return None
     if pinned == "auto":
         for name in _PROVIDER_PRIORITY:
             inst = _try_instantiate(name, tts_config)
@@ -291,6 +306,112 @@ class OpenAIStreamer(StreamingTTSProvider):
             response_format="pcm",
         ) as response:
             yield from _capped(response.iter_bytes(), "OpenAI streaming TTS")
+
+
+
+@register("qwen")
+class QwenStreamer(StreamingTTSProvider):
+    """Qwen's custom chunked PCM route (normally the Queen's port 8767 service).
+
+    The complete OpenAI-shaped Qwen endpoint remains on the configured
+    openai.base_url (the usual 8765 route). This provider is deliberately
+    separate because the optimized service exposes
+    /audio/speech/stream and returns chunked raw PCM directly.
+    """
+
+    sample_rate = 24000
+
+    @staticmethod
+    def available() -> bool:
+        # This is a local service, so there is no cloud credential to require.
+        return True
+
+    def __init__(self, tts_config: Dict, section: Dict):
+        super().__init__(tts_config, section)
+        base_url = str(section.get("base_url") or "").strip().rstrip("/")
+        streaming_url = str(section.get("streaming_url") or "").strip().rstrip("/")
+        self._endpoint = streaming_url or (
+            f"{base_url}/audio/speech/stream" if base_url else ""
+        )
+
+    def is_ready(self) -> bool:
+        return bool(self._endpoint)
+
+    def stream(self, text: str) -> Iterator[bytes]:
+        yield from _capped(self._stream(text), "Qwen streaming TTS")
+
+    def _stream(self, text: str) -> Iterator[bytes]:
+        import requests
+
+        model = str(
+            self.section.get("model") or "qwen3-tts-streaming"
+        ).strip() or "qwen3-tts-streaming"
+        payload = {
+            "model": model,
+            "input": text,
+            "response_format": "pcm",
+        }
+        voice = str(self.section.get("voice") or "").strip()
+        if voice:
+            payload["voice"] = voice
+        language = str(self.section.get("language") or "").strip()
+        if language:
+            payload["language"] = language
+
+        # Keep the tuning surface available without baking experimental
+        # defaults into Hermes. The optimized Qwen service ignores fields it
+        # does not need and supplies its own safe defaults.
+        for key in (
+            "emit_every_frames",
+            "decode_window_frames",
+            "overlap_samples",
+            "max_frames",
+            "first_chunk_emit_every",
+            "first_chunk_decode_window",
+            "first_chunk_frames",
+            "repetition_penalty",
+            "repetition_penalty_window",
+        ):
+            value = self.section.get(key)
+            if value is not None:
+                payload[key] = value
+
+        headers = {
+            "Accept": "audio/pcm",
+            "Content-Type": "application/json",
+        }
+        api_key = str(self.section.get("api_key") or "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        try:
+            read_timeout = float(self.section.get("read_timeout", 120))
+        except (TypeError, ValueError):
+            read_timeout = 120.0
+        read_timeout = max(1.0, min(read_timeout, 600.0))
+
+        with requests.post(
+            self._endpoint,
+            headers=headers,
+            json=payload,
+            timeout=(10.0, read_timeout),
+            stream=True,
+        ) as response:
+            response.raise_for_status()
+            pending = b""
+            for chunk in response.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                data = pending + bytes(chunk)
+                aligned = len(data) - (len(data) % self.sample_width)
+                if aligned:
+                    yield data[:aligned]
+                pending = data[aligned:]
+            if pending:
+                logger.debug(
+                    "Qwen streaming TTS ended with %d unaligned PCM byte",
+                    len(pending),
+                )
 
 
 def _capped(chunks: Iterator[bytes], label: str) -> Iterator[bytes]:
