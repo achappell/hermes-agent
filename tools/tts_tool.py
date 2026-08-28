@@ -51,7 +51,7 @@ from tools.tts_tool_delivery import (
     _resolve_max_text_length, _build_audio_delivery_files, _convert_to_opus, _remove_quietly,
     _repair_ogg_container, _resolve_audio_delivery_profile, _split_text_for_tts)
 from tools.tts_tool_providers import (
-    _generate_edge_tts, _generate_elevenlabs, _generate_gemini_tts, _generate_minimax_tts,
+    _config_bool, _generate_edge_tts, _generate_elevenlabs, _generate_gemini_tts, _generate_minimax_tts,
     _generate_mistral_tts, _generate_xai_tts, _resolve_minimax_tts_runtime)
 from tools.tts_tool_local import _generate_kittentts, _generate_neutts, _generate_piper_tts
 from tools.tts_tool_plugins import (
@@ -134,6 +134,21 @@ def _default_output_dir() -> str:
     if DEFAULT_OUTPUT_DIR != _DEFAULT_OUTPUT_DIR_AT_IMPORT:
         return DEFAULT_OUTPUT_DIR
     return _get_default_output_dir()
+
+
+def _tts_audio_tags_enabled(tts_config: Dict[str, Any]) -> bool:
+    """Return whether Hermes-local ``[pause]``/``[pace]`` controls are enabled.
+
+    The timing controls are opt-in so ordinary TTS remains unchanged when a
+    model emits bracketed text. ``audio_tags`` may be a boolean or an
+    ``{enabled: ...}`` block for readable config.
+    """
+    if not isinstance(tts_config, dict):
+        return False
+    raw = tts_config.get("audio_tags", False)
+    if isinstance(raw, dict):
+        raw = raw.get("enabled", False)
+    return _config_bool(raw, default=False)
 
 
 def _load_tts_config() -> Dict[str, Any]:
@@ -279,6 +294,194 @@ def _session_platform() -> tuple:
     return platform, platform in OPUS_VOICE_PLATFORMS
 
 
+def _atempo_filter(speed: float) -> str:
+    """Build an ffmpeg ``atempo`` chain for Hermes' 0.25-4.0 range."""
+    remaining = max(0.25, min(4.0, float(speed)))
+    filters: List[str] = []
+    while remaining < 0.5:
+        filters.append("atempo=0.5")
+        remaining /= 0.5
+    while remaining > 2.0:
+        filters.append("atempo=2.0")
+        remaining /= 2.0
+    filters.append(f"atempo={remaining:.6f}")
+    return ",".join(filters)
+
+
+def _configured_tts_speed(
+    tts_config: Dict[str, Any],
+    requested_speed: Optional[float],
+) -> float:
+    """Resolve the effective speed using the same precedence as OpenAI TTS."""
+    if requested_speed is not None:
+        raw_speed: Any = requested_speed
+    else:
+        openai_config = (tts_config.get("openai") if isinstance(tts_config, dict) else None) or {}
+        raw_speed = openai_config.get(
+            "speed",
+            tts_config.get("speed", 1.0) if isinstance(tts_config, dict) else 1.0,
+        )
+    try:
+        return max(0.25, min(4.0, float(raw_speed)))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _qwen_local_speed(
+    tts_config: Dict[str, Any],
+    provider: str,
+    requested_speed: Optional[float],
+) -> Optional[float]:
+    """Return a local playback speed for Qwen OpenAI-compatible endpoints.
+
+    Qwen's OpenAI-shaped servers accept the ``speed`` field for compatibility
+    but do not use it during generation.  Hermes therefore applies the value
+    after rendering, but only when the configured model or endpoint identifies
+    itself as Qwen; real OpenAI and other providers keep their native behavior.
+    """
+    if provider.lower().strip() != "openai":
+        return None
+    openai_config = (tts_config.get("openai") if isinstance(tts_config, dict) else None) or {}
+    model = str(openai_config.get("model") or "").lower()
+    base_url = str(openai_config.get("base_url") or "").lower()
+    if "qwen" not in model and "qwen" not in base_url:
+        return None
+    return _configured_tts_speed(tts_config, requested_speed)
+
+
+def _audio_codec_args_for_suffix(suffix: str) -> List[str]:
+    """Return deterministic ffmpeg encoding args for a destination suffix."""
+    suffix = suffix.lower()
+    if suffix in {".ogg", ".opus"}:
+        return ["-c:a", "libopus", "-ac", "1", "-b:a", "64k", "-vbr", "off"]
+    if suffix == ".mp3":
+        return ["-c:a", "libmp3lame", "-q:a", "2"]
+    if suffix == ".m4a":
+        return ["-c:a", "aac", "-b:a", "128k"]
+    if suffix == ".wav":
+        return ["-c:a", "pcm_s16le"]
+    if suffix == ".flac":
+        return ["-c:a", "flac"]
+    if suffix == ".aac":
+        return ["-c:a", "aac", "-b:a", "128k"]
+    return []
+
+
+def _apply_audio_speed(input_path: str, output_path: str, speed: float) -> str:
+    """Time-stretch one encoded audio file without changing its pitch."""
+    source = Path(input_path)
+    destination = Path(output_path)
+    if not source.exists() or source.stat().st_size <= 0:
+        raise RuntimeError(f"cannot pace missing audio file: {source}")
+    if speed <= 0:
+        raise ValueError("pace must be greater than zero")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if abs(float(speed) - 1.0) < 0.001:
+        shutil.copyfile(source, destination)
+        return str(destination)
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required for [pace:...] tags")
+    temp_output = destination.with_name(
+        f".{destination.name}.{uuid.uuid4().hex}.pacing{destination.suffix}"
+    )
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(source),
+        "-filter:a",
+        _atempo_filter(speed),
+        "-vn",
+    ]
+    command.extend(_audio_codec_args_for_suffix(destination.suffix))
+    command.append(str(temp_output))
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=120,
+            stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
+        )
+        if (
+            result.returncode != 0
+            or not temp_output.exists()
+            or temp_output.stat().st_size <= 0
+        ):
+            detail = result.stderr.decode("utf-8", errors="ignore")[:500]
+            raise RuntimeError(f"ffmpeg pacing failed: {detail or 'no output'}")
+        os.replace(temp_output, destination)
+        return str(destination)
+    finally:
+        try:
+            temp_output.unlink()
+        except OSError:
+            pass
+
+
+def _generate_silence_audio(output_path: str, seconds: float) -> str:
+    """Create a mono 24 kHz silence clip in the requested output format."""
+    duration = max(0.0, min(10.0, float(seconds)))
+    if duration <= 0.0:
+        raise ValueError("pause must be greater than zero")
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required for [pause:...] tags")
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_output = destination.with_name(
+        f".{destination.name}.{uuid.uuid4().hex}.silence{destination.suffix}"
+    )
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=r=24000:cl=mono",
+        "-t",
+        f"{duration:.3f}",
+        "-vn",
+    ]
+    command.extend(_audio_codec_args_for_suffix(destination.suffix))
+    command.append(str(temp_output))
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=60,
+            stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
+        )
+        if (
+            result.returncode != 0
+            or not temp_output.exists()
+            or temp_output.stat().st_size <= 0
+        ):
+            detail = result.stderr.decode("utf-8", errors="ignore")[:500]
+            raise RuntimeError(f"ffmpeg silence generation failed: {detail or 'no output'}")
+        os.replace(temp_output, destination)
+        return str(destination)
+    finally:
+        try:
+            temp_output.unlink()
+        except OSError:
+            pass
+
+
+    from gateway.session_context import get_session_env
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
+    return platform, platform in OPUS_VOICE_PLATFORMS
+
+
 def _resolve_output_base(
     output_path: Optional[str], provider: str, command_provider_config: Optional[Dict[str, Any]], want_opus: bool,
 ) -> tuple:
@@ -378,20 +581,45 @@ class _ChunkFailed(Exception):
     """One chunk's synthesis returned an error envelope; message is the final tool error text."""
 
 
-def _synthesize_chunks(chunks: List[str], base_path: Path, generated_artifacts: set, **single_kwargs) -> tuple:
-    """Synthesize chunks into ``<base>.chunkNNN<ext>`` (or ``base`` alone) -> ``(encoded_paths, results)``.
+def _synthesize_chunks(
+    work_items: List[Dict[str, Any]], base_path: Path, generated_artifacts: set, **single_kwargs
+) -> tuple:
+    """Synthesize work items into ``<base>.chunkNNN<ext>`` (or ``base`` alone) -> ``(encoded_paths, results)``.
 
-    Every touched path lands in *generated_artifacts* for the caller's sweep. Raises
-    :class:`_ChunkFailed` on a reported failure, ``RuntimeError`` on garbage or missing audio."""
+    Each item is either ``{"text": ..., "pace": <float|None>}`` or ``{"pause_seconds": <float>}`` (real
+    silence, rendered via ``_generate_silence_audio``). A ``pace`` is absolute: the segment renders at
+    neutral provider speed (``tts_config["speed"]`` forced to 1.0), then is time-stretched locally via
+    ``_apply_audio_speed`` — Qwen's OpenAI-compatible endpoints accept ``speed`` for API compatibility
+    but ignore it during generation. Every touched path lands in *generated_artifacts* for the caller's
+    sweep. Raises :class:`_ChunkFailed` on a reported failure, ``RuntimeError`` on garbage or missing
+    audio."""
     provider = single_kwargs["provider"]
+    tts_config = single_kwargs.pop("tts_config")
+    want_opus = single_kwargs.get("want_opus")
     encoded_paths: List[str] = []
     chunk_results: List[Dict[str, Any]] = []
-    for index, chunk in enumerate(chunks, start=1):
+    for index, item in enumerate(work_items, start=1):
         chunk_path = base_path
-        if len(chunks) > 1:
+        if len(work_items) > 1:
             chunk_path = base_path.with_name(f"{base_path.stem}.chunk{index:03d}{base_path.suffix}")
         generated_artifacts.add(str(chunk_path))
-        raw_result = _text_to_speech_single(chunk, str(chunk_path), **single_kwargs)
+
+        pause_seconds = float(item.get("pause_seconds") or 0.0)
+        if pause_seconds > 0.0:
+            _generate_silence_audio(str(chunk_path), pause_seconds)
+            encoded_paths.append(str(chunk_path))
+            chunk_results.append({
+                "provider": provider,
+                "pause": True,
+                "voice_compatible": bool(want_opus) and chunk_path.suffix.lower() in {".ogg", ".opus"},
+            })
+            continue
+
+        chunk = str(item.get("text") or "")
+        segment_pace = item.get("pace")
+        item_tts_config = {**tts_config, "speed": 1.0} if segment_pace is not None else tts_config
+        raw_result = _text_to_speech_single(
+            chunk, str(chunk_path), tts_config=item_tts_config, **single_kwargs)
         try:
             chunk_result = json.loads(raw_result)
         except (json.JSONDecodeError, TypeError):
@@ -403,6 +631,12 @@ def _synthesize_chunks(chunks: List[str], base_path: Path, generated_artifacts: 
         if not os.path.isfile(actual_path) or os.path.getsize(actual_path) <= 0:
             raise RuntimeError(f"TTS chunk {index} produced no final audio: {actual_path}")
         generated_artifacts.add(actual_path)
+
+        if segment_pace is not None and abs(float(segment_pace) - 1.0) >= 0.001:
+            paced_path = Path(actual_path).with_name(
+                f".{Path(actual_path).stem}.{uuid.uuid4().hex}.paced{Path(actual_path).suffix}")
+            actual_path = _apply_audio_speed(actual_path, str(paced_path), float(segment_pace))
+            generated_artifacts.add(actual_path)
         encoded_paths.append(actual_path)
         chunk_results.append(chunk_result)
     return encoded_paths, chunk_results
@@ -428,12 +662,40 @@ def text_to_speech_tool(
     tts_config, provider = _apply_call_overrides(_load_tts_config(), speed, provider)
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
     max_len = _resolve_max_text_length(provider, tts_config)
-    chunks = _split_text_for_tts(text, max_len)
-    if not chunks:
+    if _tts_audio_tags_enabled(tts_config):
+        try:
+            from tools.tts_text_normalize import parse_audio_tags
+            tag_parts, has_audio_tags = parse_audio_tags(text)
+        except Exception:
+            tag_parts, has_audio_tags = [], False
+    else:
+        tag_parts, has_audio_tags = [], False
+
+    # A tagged script becomes an ordered list of text chunks and real silence
+    # parts.  Untagged calls keep the existing one-list path byte-for-byte.
+    work_items: List[Dict[str, Any]] = []
+    if has_audio_tags:
+        for part in tag_parts:
+            if part.pause_seconds > 0:
+                work_items.append({"pause_seconds": part.pause_seconds})
+                continue
+            for chunk in _split_text_for_tts(part.text, max_len):
+                work_items.append({"text": chunk, "pace": part.pace})
+    else:
+        chunks = _split_text_for_tts(text, max_len)
+        work_items = [{"text": chunk, "pace": None} for chunk in chunks]
+
+    if not work_items:
         return tool_error("Text is required", success=False)
-    if len(chunks) > 1:
+    if len(work_items) > 1:
         logger.info("TTS text for provider %s split into %d chunks (input=%d chars, cap=%d)",
-                    provider, len(chunks), len(text), max_len)
+                    provider, len(work_items), len(text), max_len)
+    if has_audio_tags:
+        logger.info(
+            "TTS audio controls resolved into %d ordered parts for provider %s",
+            len(work_items),
+            provider,
+        )
     platform, want_opus = _session_platform()
     delivery_profile = _resolve_audio_delivery_profile(platform, tts_config)
     base_path, error = _resolve_output_base(
@@ -444,20 +706,49 @@ def text_to_speech_tool(
     final_paths: List[str] = []
     try:
         encoded_paths, chunk_results = _synthesize_chunks(
-            chunks, base_path, generated_artifacts, provider=provider, tts_config=tts_config,
+            work_items, base_path, generated_artifacts, provider=provider, tts_config=tts_config,
             command_provider_config=command_provider_config, want_opus=want_opus,
             instructions=instructions)
-        voice_compatible = bool(chunk_results) and all(bool(r.get("voice_compatible")) for r in chunk_results)
+        spoken_results = [result for result in chunk_results if not result.get("pause")]
+        voice_compatible = bool(spoken_results) and all(
+            bool(r.get("voice_compatible")) for r in spoken_results)
         delivery_base = base_path.with_suffix(Path(encoded_paths[0]).suffix)
         final_paths, combined_chunks = _build_audio_delivery_files(
-            encoded_paths, str(delivery_base), delivery_profile, voice_compatible=voice_compatible)
+            encoded_paths, str(delivery_base), delivery_profile, voice_compatible=voice_compatible,
+            force_reencode=has_audio_tags)
+
+        # Qwen's OpenAI-compatible endpoints accept ``speed`` for API
+        # compatibility but currently ignore it.  Apply the configured
+        # playback multiplier once to the finished, untagged deliverable so
+        # Amanda's existing speed knob actually changes what she hears.  The
+        # tagged path is deliberately excluded: its segments already use
+        # explicit neutral rendering plus local [pace:...] transforms.
+        local_speed = _qwen_local_speed(tts_config, provider, speed)
+        if (
+            local_speed is not None
+            and not has_audio_tags
+            and abs(local_speed - 1.0) >= 0.001
+        ):
+            for path in final_paths:
+                source = Path(path)
+                paced_path = source.with_name(
+                    f".{source.stem}.{uuid.uuid4().hex}.speed{source.suffix}"
+                )
+                _apply_audio_speed(str(source), str(paced_path), local_speed)
+                os.replace(paced_path, source)
+            logger.info(
+                "Applied local Qwen TTS playback speed %.3fx to %d deliverable(s)",
+                local_speed,
+                len(final_paths),
+            )
+
         for path in final_paths:
             logger.info("TTS audio saved: %s (%s bytes, provider: %s)", path, f"{os.path.getsize(path):,}", provider)
         return json.dumps({
             "success": True, "file_path": final_paths[0], "file_paths": final_paths,
             "media_tag": _media_tag(final_paths, voice_compatible),
             "provider": chunk_results[0].get("provider", provider), "voice_compatible": voice_compatible,
-            "chunk_count": len(chunks), "delivery_file_count": len(final_paths),
+            "chunk_count": len(work_items), "delivery_file_count": len(final_paths),
             "combined_chunks": bool(combined_chunks),
             "delivery_profile": {
                 "platform": delivery_profile.platform, "max_file_bytes": delivery_profile.max_file_bytes,
@@ -530,7 +821,18 @@ TTS_SCHEMA = {
         "properties": {
             "text": {
                 "type": "string",
-                "description": "The text to convert to speech. Provider-specific per-request character caps apply automatically (OpenAI 4096, xAI 15000, MiniMax 10000, ElevenLabs 5k-40k depending on model); longer input is split into ordered chunks without silent truncation."
+                "description": (
+                    "The text to convert to speech. Provider-specific per-request "
+                    "character caps apply automatically (OpenAI 4096, xAI 15000, "
+                    "MiniMax 10000, ElevenLabs 5k-40k depending on model); longer "
+                    "input is split into ordered chunks without silent truncation. "
+                    "For deterministic timing, first enable tts.audio_tags: true "
+                    "in config.yaml, then use [pause:300ms] or [pause:1.2s] and "
+                    "[pace:0.9] controls; pace is an absolute multiplier for "
+                    "following text and remains active until changed. With the "
+                    "setting disabled (the default), bracketed controls are "
+                    "passed through as ordinary text."
+                )
             },
             "output_path": {
                 "type": "string",

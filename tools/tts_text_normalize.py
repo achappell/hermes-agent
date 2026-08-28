@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import html
 import re
+from dataclasses import dataclass
 
 # Sentinel appended to former heading lines so smooth_whitespace_for_tts folds the
 # heading into the sentence after it ("Weather, it will be sunny") instead of a bare
@@ -41,6 +42,76 @@ _CURRENCY_WORDS = (
     (r"NZ\$", "New Zealand dollars", re.IGNORECASE), (r"A\$", "Australian dollars", re.IGNORECASE),
     (r"US\$", "US dollars", re.IGNORECASE), ("€", "euros", 0), ("£", "pounds", 0), (r"\$", "dollars", 0),
 )
+
+# Hermes-side timing controls.  Qwen's Base voice-clone model does not parse
+# expressive markup, so these tags are deliberately handled before provider
+# dispatch and never sent to the model.  Pause units are explicit to avoid the
+# wonderfully dangerous ambiguity of ``[pause:2]``.
+_AUDIO_TAG_RE = re.compile(
+    r"\[\s*(?P<kind>pause|pace)\s*:\s*"
+    r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>ms|s)?\s*\]",
+    flags=re.IGNORECASE,
+)
+_AUDIO_TAG_MIN_PACE = 0.25
+_AUDIO_TAG_MAX_PACE = 4.0
+_AUDIO_TAG_MAX_PAUSE_SECONDS = 10.0
+
+
+@dataclass(frozen=True)
+class TtsAudioTagPart:
+    """One spoken part or one deterministic pause in a tagged TTS script."""
+
+    text: str = ""
+    pace: float | None = None
+    pause_seconds: float = 0.0
+
+
+def parse_audio_tags(text: str) -> tuple[list[TtsAudioTagPart], bool]:
+    """Parse Hermes' deterministic ``[pace:...]``/``[pause:...]`` controls.
+
+    ``pace`` is an absolute playback multiplier for following text (0.25 to
+    4.0); it remains in effect until another pace tag appears.  ``pause`` is a
+    literal silence duration (milliseconds or seconds), capped at ten seconds.
+    Invalid or unsupported-looking tags are left in the spoken text rather
+    than silently discarded.  The bool says whether at least one valid control
+    tag was found.
+    """
+    raw = str(text or "")
+    parts: list[TtsAudioTagPart] = []
+    cursor = 0
+    current_pace: float | None = None
+    found = False
+
+    def append_text(value: str) -> None:
+        spoken = re.sub(r"\s+", " ", value).strip()
+        if spoken:
+            parts.append(TtsAudioTagPart(text=spoken, pace=current_pace))
+
+    for match in _AUDIO_TAG_RE.finditer(raw):
+        kind = match.group("kind").lower()
+        unit = (match.group("unit") or "").lower()
+        # A pause without an explicit unit is intentionally not a control.
+        if (kind == "pause" and not unit) or (kind == "pace" and unit):
+            continue
+        found = True
+        append_text(raw[cursor:match.start()])
+        value = float(match.group("value"))
+        if kind == "pace":
+            current_pace = max(_AUDIO_TAG_MIN_PACE, min(_AUDIO_TAG_MAX_PACE, value))
+        else:
+            seconds = value / 1000.0 if unit == "ms" else value
+            parts.append(
+                TtsAudioTagPart(
+                    pause_seconds=max(0.0, min(_AUDIO_TAG_MAX_PAUSE_SECONDS, seconds))
+                )
+            )
+        cursor = match.end()
+
+    if found:
+        append_text(raw[cursor:])
+        return parts, True
+    return [TtsAudioTagPart(text=raw.strip())] if raw.strip() else [], False
+
 
 # Broad emoji / pictograph cleanup: most voice providers read emojis as awkward labels.
 _EMOJI_RE = re.compile(
