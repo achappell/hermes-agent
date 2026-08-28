@@ -10,7 +10,7 @@ Lifecycle::
     agent.stream_delta_callback = consumer.on_delta   # sync, non-blocking
     ... agent runs in executor ...
     consumer.finish()            # signal end-of-text
-    success = await consumer.wait_complete(timeout=10)
+    success = await consumer.wait_complete(timeout=60)
     if consumer.suppress_whole_file:
         # suppress whole-file auto-TTS for this turn
     consumer.abort("cancelled")  # idempotent cancellation
@@ -410,7 +410,7 @@ class StreamingTTSConsumer:
             except Exception:
                 pass
 
-    async def wait_complete(self, timeout: float = 10.0) -> bool:
+    async def wait_complete(self, timeout: float = 60.0) -> bool:
         """Wait for the drain task to finish. Returns True only on full success."""
         if self._task is None:
             return self._completed

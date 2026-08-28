@@ -95,6 +95,39 @@ _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 # 180s budget (is_reconnect=True preserves the offline update queue, #46621).
 _TELEGRAM_INITIAL_CONNECT_TIMEOUT_SECS_DEFAULT = 45.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+# A streamed voice turn can finish generating text before the last queued
+# sentence has finished synthesising. Ten seconds was enough for short probes,
+# but cut off longer replies at the exact point where the gateway finalised the
+# turn. Keep the drain bounded, while allowing a profile to tune it.
+_STREAMING_TTS_FINALIZATION_TIMEOUT_DEFAULT = 60.0
+_STREAMING_TTS_FINALIZATION_TIMEOUT_MAX = 600.0
+
+
+def _streaming_tts_finalization_timeout(
+    tts_config: Optional[Dict[str, Any]],
+) -> float:
+    """Resolve the bounded post-agent streaming-TTS drain timeout."""
+    streaming_config = (
+        tts_config.get("streaming")
+        if isinstance(tts_config, dict)
+        else None
+    )
+    raw_timeout = (
+        streaming_config.get("finalization_timeout")
+        if isinstance(streaming_config, dict)
+        else None
+    )
+    try:
+        timeout = (
+            float(raw_timeout)
+            if raw_timeout is not None
+            else _STREAMING_TTS_FINALIZATION_TIMEOUT_DEFAULT
+        )
+    except (TypeError, ValueError):
+        timeout = _STREAMING_TTS_FINALIZATION_TIMEOUT_DEFAULT
+    return max(1.0, min(timeout, _STREAMING_TTS_FINALIZATION_TIMEOUT_MAX))
+
+
 # End reasons that mean the USER deliberately closed this thread of work
 # (/new -> session_reset / new_session, an explicit exit, or a /switch).
 # Shared by _classify_completion_target (pre-flight verdict) and
@@ -31364,7 +31397,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             #
             # finish() is called from the outer event-loop thread (not the
             # executor worker) so early returns from run_sync are also
-            # finalised.  wait_complete() drains queued audio; on timeout
+            # finalised.  wait_complete() drains queued audio; the bounded
+            # timeout is configurable at tts.streaming.finalization_timeout.
+            # On timeout
             # the consumer is aborted unconditionally — if audio was
             # audible, suppression is preserved so the gateway does not
             # replay from the beginning; if no audio was audible, the
@@ -31373,7 +31408,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _stts is not None:
                 _stts.finish()
                 try:
-                    await _stts.wait_complete(timeout=10.0)
+                    _stts_timeout = _streaming_tts_finalization_timeout(
+                        _load_tts_config()
+                    )
+                    await _stts.wait_complete(timeout=_stts_timeout)
                 except Exception as _stts_done_err:
                     logger.debug("streaming TTS wait_complete error: %s", _stts_done_err)
                 if not _stts.done:
