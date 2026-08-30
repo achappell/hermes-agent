@@ -21,6 +21,10 @@
 
 import path from 'node:path'
 
+import { findPackedPayload, relativizePayloadLinks, stripFetchCache } from './materialize-payload-links.mjs'
+import { batchSignAppTree } from './batch-sign-binaries.mjs'
+import { resolveSigningIdentity, signNestedChromium } from './sign-nested-chromium.mjs'
+import { sanitizeTree } from './sanitize-pe-signatures.mjs'
 import { stampExeIdentity } from './set-exe-identity.mjs'
 
 export default async function afterPack(context) {
@@ -38,4 +42,12 @@ export default async function afterPack(context) {
     // Never fail the build over a cosmetic stamp.
     console.warn(`[after-pack] exe identity stamp failed (${err.message}); Hermes.exe keeps the stock Electron icon`)
   }
+
+  // Batch-sign every payload binary AFTER sanitize (above) and the rcedit
+  // stamp: a dangling certificate table or a subsequent resource edit would
+  // invalidate the signature. The product exe is excluded here and signed
+  // per-file by the customSign hook (scripts/batch-sign-binaries.mjs) after
+  // electron-builder's own rcedit + fuses pass. No-op with a loud warning when
+  // the AZURE_SIGN_* environment is absent (unsigned/fork/nightly lanes).
+  batchSignAppTree(context.appOutDir, exe)
 }

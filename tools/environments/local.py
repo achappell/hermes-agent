@@ -1588,28 +1588,62 @@ _in_venv: bool = (
 _hermes_site_packages: list[Path] | None = None
 
 
-def _validated_runtime_venv(env: dict) -> Path | None:
-    """Return a producer-owned runtime venv identified by VIRTUAL_ENV.
+def _pm_runtime_venv_dir() -> Path | None:
+    """The venv pm provisioned for this install, resolved from pm's own
+    records (facts.json + store layout) — never from interpreter state or
+    the ambient environment.
 
-    A user may carry an unrelated VIRTUAL_ENV, so the variable alone is not
-    provenance.  The legacy Windows base-Python gateway producer uses the exact
-    ``<Hermes repo>/venv`` layout and a real venv marker; require both before
-    accepting its separate runtime venv.
+    Under no-boot-through-venv the gateway runs the store python with the
+    venv's site-packages on PYTHONPATH, so ``VIRTUAL_ENV`` is unset in
+    bundled installs and a user-carried value is unproven provenance
+    anyway. pm is the authority: a bundled install keeps its relocatable
+    venv beside the manifest (a sibling of the store), a dev install syncs
+    the project venv (``venv``/``.venv`` — the same layout
+    ``pm.packages.Venv.venv_dir`` materializes). The venv fact must exist:
+    pm only vouches for what it provisioned.
     """
-    value = env.get("VIRTUAL_ENV")
-    if not value:
-        return None
-
-    candidate = Path(value)
-    if not any(_same_path(candidate, repo_root / "venv") for repo_root in _hermes_repo_root_aliases):
-        return None
-
     try:
-        if not (candidate / "pyvenv.cfg").is_file():
-            return None
-    except OSError:
+        from pm import paths
+        from pm.lock import Facts
+    except Exception:
         return None
+    try:
+        if not Facts(paths.facts_path()).get("venv"):
+            return None
+    except Exception:
+        return None
+    store = paths.store_root()
+    bundled = store.parent / "venv"
+    if (store.parent / "manifest.json").is_file():
+        return bundled if bundled.is_dir() else None
+    try:
+        from hermes_constants import project_venv_dir
+    except ImportError:
+        return None
+    return project_venv_dir(paths.repo_root())
 
+
+def _runtime_venv_site_packages(venv: Path) -> Path:
+    """The site-packages dir of *venv* under pm's venv layout (uv-created:
+    ``Lib/site-packages`` on Windows, ``lib/pythonX.Y/site-packages``
+    otherwise)."""
+    if _IS_WINDOWS:
+        return venv / "Lib" / "site-packages"
+    pyver = f"python{sys.version_info[0]}.{sys.version_info[1]}"
+    return venv / "lib" / pyver / "site-packages"
+
+
+def _validated_runtime_venv(env: dict) -> Path | None:
+    """Return the pm-provisioned runtime venv, when pm owns one here.
+
+    The *env* parameter is retained for call-site compatibility; provenance
+    now comes from pm's facts/store (see ``_pm_runtime_venv_dir``), not from
+    a validated ``VIRTUAL_ENV`` — an inherited value could always name an
+    unrelated venv, and under no-boot-through-venv it is simply unset.
+    """
+    candidate = _pm_runtime_venv_dir()
+    if candidate is None or not candidate.is_dir():
+        return None
     return candidate
 
 
@@ -1619,8 +1653,11 @@ def _get_hermes_site_packages(env: dict) -> list[Path]:
     Uses ``site.getsitepackages()`` when available for robustness (it respects
     ``.pth`` rewrites and platform conventions), with a manual fallback that
     constructs the canonical path from ``sys.prefix`` for POSIX and Windows.
-    A validated Windows base-interpreter launch contributes its separate
-    ``VIRTUAL_ENV/Lib/site-packages`` directory as an additional exact entry.
+    The pm-provisioned runtime venv (facts/store resolution — see
+    ``_validated_runtime_venv``) contributes its site-packages as an
+    additional exact entry; under no-boot-through-venv the running
+    interpreter is the store python and this is how its real site-packages
+    are identified.
     """
     global _hermes_site_packages
     if _hermes_site_packages is not None:
@@ -1650,7 +1687,7 @@ def _get_hermes_site_packages(env: dict) -> list[Path]:
 
     runtime_venv = _validated_runtime_venv(env)
     if runtime_venv is not None:
-        runtime_site_packages = runtime_venv / "Lib" / "site-packages"
+        runtime_site_packages = _runtime_venv_site_packages(runtime_venv)
         if not any(_same_path(runtime_site_packages, existing) for existing in result):
             result.append(runtime_site_packages)
 

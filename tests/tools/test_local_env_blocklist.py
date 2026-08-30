@@ -583,30 +583,44 @@ class TestPythonpathSelectiveStrip:
 
 
     def test_base_python_sanitizer_uses_validated_separate_runtime_venv(self, tmp_path, monkeypatch):
-        """A base interpreter strips the exact Windows runtime site-packages.
+        """A base interpreter strips the exact pm runtime site-packages.
 
         This deliberately uses a synthetic Hermes venv separate from the test
-        runner: sys.prefix represents base Python, while validated VIRTUAL_ENV
-        identifies ``<repo>/venv`` as the Hermes runtime producer contract.
+        runner: sys.prefix represents base Python, while the pm-provisioned
+        runtime venv (facts + store layout, no VIRTUAL_ENV anywhere)
+        identifies the Hermes runtime site-packages.
         """
+        import json
+
         import tools.environments.local as local
 
-        repo_root = tmp_path / "hermes-agent"
-        runtime_venv = repo_root / "venv"
-        runtime_sp = runtime_venv / "Lib" / "site-packages"
+        # pm bundled-install layout: store + manifest + relocatable venv.
+        payload = tmp_path / "payload"
+        store = payload / "tools"
+        runtime_venv = payload / "venv"
+        runtime_sp = local._runtime_venv_site_packages(runtime_venv)
         runtime_sp.mkdir(parents=True)
-        (runtime_venv / "pyvenv.cfg").write_text("version = 3.11\n", encoding="utf-8")
+        store.mkdir(parents=True, exist_ok=True)
+        (payload / "manifest.json").write_text("{}", encoding="utf-8")
+        (store / "facts.json").write_text(
+            json.dumps(
+                {"schema": 1, "packages": {"venv": {"stamp": "abc", "extras": []}}}
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_RUNTIME_DIR", str(store))
+        monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+
         base_prefix = tmp_path / "base-python"
         unrelated = "/custom/lib/python3.13/site-packages"
 
-        monkeypatch.setattr(local, "_hermes_repo_root_aliases", (repo_root,))
+        monkeypatch.setattr(local, "_hermes_repo_root_aliases", (tmp_path / "hermes-agent",))
         monkeypatch.setattr(local, "_in_venv", False)
         monkeypatch.setattr(local, "_hermes_site_packages", None)
         monkeypatch.setattr(local.sys, "prefix", str(base_prefix))
         monkeypatch.setattr(local.sys, "base_prefix", str(base_prefix))
 
         env = {
-            "VIRTUAL_ENV": str(runtime_venv),
             "PYTHONPATH": os.pathsep.join([str(runtime_sp), unrelated]),
         }
         result = local._sanitize_subprocess_env(env)
@@ -617,17 +631,18 @@ class TestPythonpathSelectiveStrip:
         assert "VIRTUAL_ENV" not in result
 
     def test_unrelated_virtual_env_is_not_runtime_provenance(self, tmp_path, monkeypatch):
-        """An arbitrary inherited VIRTUAL_ENV cannot claim PYTHONPATH ownership."""
+        """An arbitrary inherited VIRTUAL_ENV cannot claim PYTHONPATH
+        ownership — provenance is pm's facts, and pm records no venv here."""
         import tools.environments.local as local
 
-        repo_root = tmp_path / "hermes-agent"
-        repo_root.mkdir()
         unrelated_venv = tmp_path / "user-venv"
         unrelated_sp = unrelated_venv / "Lib" / "site-packages"
         unrelated_sp.mkdir(parents=True)
         (unrelated_venv / "pyvenv.cfg").write_text("version = 3.13\n", encoding="utf-8")
 
-        monkeypatch.setattr(local, "_hermes_repo_root_aliases", (repo_root,))
+        monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "no-such-store"))
+        monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+        monkeypatch.setattr(local, "_hermes_repo_root_aliases", (tmp_path / "hermes-agent",))
         monkeypatch.setattr(local, "_in_venv", False)
         monkeypatch.setattr(local, "_hermes_site_packages", None)
 
@@ -993,44 +1008,42 @@ class TestPythonpathSelectiveStrip:
         local._strip_hermes_owned_pythonpath(env)
         assert env["PYTHONPATH"].split(os.pathsep) == ["/home/user/my-lib"]
 
-    def test_validated_runtime_venv_lexical_after_repo_recovery(self, tmp_path, monkeypatch):
-        """uv-base gateway: once the lexical repo alias is recovered, a lexical
-        VIRTUAL_ENV (<lexical repo>/venv) validates and its site-packages is
-        stripped together with the repo root, while user entries survive.
+    def test_pm_runtime_venv_provenance_is_alias_independent(self, tmp_path, monkeypatch):
+        """pm's facts/store layout is the provenance for the runtime venv —
+        not a VIRTUAL_ENV matched against repo aliases. The pm-provisioned
+        venv's site-packages is stripped together with the repo root, while
+        user entries survive, even when an unrelated VIRTUAL_ENV is present.
         """
+        import json
+
         import tools.environments.local as local
 
-        physical_root = _physical_repo_root(tmp_path)
-        venv_dir = physical_root / "venv"
-        venv_dir.mkdir(parents=True)
-        (venv_dir / "pyvenv.cfg").write_text("home = x\n", encoding="utf-8")
-        configured_home = tmp_path / "configured-home"
-        configured_home.mkdir()
-        try:
-            _make_directory_link(configured_home / "hermes-agent", physical_root)
-        except OSError as exc:
-            pytest.skip(f"directory link unavailable on this host: {exc}")
-
-        lexical_root = configured_home / "hermes-agent"
-        aliases = local._build_hermes_repo_root_aliases(
-            physical_root.resolve(),
-            physical_root,
-            configured_home,
+        # pm bundled-install layout, entirely outside the repo aliases.
+        payload = tmp_path / "payload"
+        store = payload / "tools"
+        venv_dir = payload / "venv"
+        venv_sp = local._runtime_venv_site_packages(venv_dir)
+        venv_sp.mkdir(parents=True)
+        store.mkdir(parents=True, exist_ok=True)
+        (payload / "manifest.json").write_text("{}", encoding="utf-8")
+        (store / "facts.json").write_text(
+            json.dumps(
+                {"schema": 1, "packages": {"venv": {"stamp": "abc", "extras": []}}}
+            ),
+            encoding="utf-8",
         )
-        assert any(local._same_path(a, lexical_root) for a in aliases)
-        monkeypatch.setattr(local, "_hermes_repo_root_aliases", aliases)
+        monkeypatch.setenv("HERMES_RUNTIME_DIR", str(store))
 
-        lexical_venv = lexical_root / "venv"
-        validated = local._validated_runtime_venv({"VIRTUAL_ENV": str(lexical_venv)})
+        validated = local._validated_runtime_venv({"VIRTUAL_ENV": "/somewhere/else"})
         assert validated is not None
-        assert local._same_path(validated, lexical_venv)
+        assert local._same_path(validated, venv_dir)
 
-        local._hermes_site_packages = None
+        monkeypatch.setattr(local, "_hermes_site_packages", None)
+        monkeypatch.setattr(local, "_in_venv", False)
         env = {"PYTHONPATH": os.pathsep.join([
-            str(lexical_root),
-            str(lexical_venv / "Lib" / "site-packages"),
+            str(venv_sp),
             "/home/user/my-lib",
-        ]), "VIRTUAL_ENV": str(lexical_venv)}
+        ])}
         local._strip_hermes_owned_pythonpath(env)
         assert env["PYTHONPATH"].split(os.pathsep) == ["/home/user/my-lib"]
 

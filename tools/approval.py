@@ -2590,11 +2590,18 @@ def human_wait_ceiling() -> float:
     config cache.
 
     Platform safety: ``_get_approval_timeout`` caps at
-    ``agent.deadline.MAX_SAFE_TIMEOUT_S``, so this value is always safe to
-    hand to ``Lock.acquire(timeout=...)`` / ``Thread.join(timeout=...)``
-    (#83220 macOS time_t overflow).
+    ``agent.deadline.MAX_SAFE_TIMEOUT_S``; the margin is added only within
+    that cap (min with the cap) so the result is always safe to hand to
+    ``Lock.acquire(timeout=...)`` / ``Thread.join(timeout=...)`` — on
+    Windows the binding limit is the DWORD-millisecond cap (~49.7 days)
+    and cap+margin would overflow it (#83220 class).
     """
-    return float(_get_approval_timeout()) + HUMAN_WAIT_MARGIN_S
+    from agent.deadline import MAX_SAFE_TIMEOUT_S
+
+    return min(
+        float(_get_approval_timeout()) + HUMAN_WAIT_MARGIN_S,
+        MAX_SAFE_TIMEOUT_S,
+    )
 
 
 def _clamped_window_seconds(started: float, now: float, ceiling: float) -> float:
@@ -3471,9 +3478,11 @@ def _get_approval_timeout() -> int:
         safe_cap = int(MAX_SAFE_TIMEOUT_S)
     except Exception:
         # Fail CLOSED: returning the raw value here would re-open the exact
-        # time_t overflow this clamp exists to prevent. ~1 year, matching
-        # agent.deadline.MAX_SAFE_TIMEOUT_S.
-        safe_cap = 365 * 24 * 3600
+        # time_t overflow this clamp exists to prevent. Use the conservative
+        # cross-platform bound — below the Windows DWORD-millisecond cap
+        # (~49.7 days) so the fallback is safe even where the platform-aware
+        # constant cannot be read.
+        safe_cap = 40 * 24 * 3600  # 40 days < 0xFFFFFFFF ms / 1000
     if raw > safe_cap:
         logger.warning(
             "approvals.timeout=%s exceeds the platform-safe maximum; "

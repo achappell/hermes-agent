@@ -209,7 +209,12 @@ def _clone_all_copytree_ignore(source_dir: Path):
 # The default profile contains infrastructure (repo checkout, worktrees, DBs,
 # caches, binaries) that named profiles don't have.  We exclude those so the
 # export is a portable, reasonable-size archive of actual profile data.
-_DEFAULT_EXPORT_EXCLUDE_ROOT = frozenset({
+# The ONE exclude-list authority for "infrastructure / runtime state that is
+# not profile data". The export path (``_default_export_ignore``) consumes it
+# directly; the distribution path (``profile_distribution.USER_OWNED_EXCLUDE``)
+# layers its distribution-specific additions on top of it. Keep new root
+# artifacts here — not in a downstream copy.
+_DEFAULT_EXPORT_EXCLUDE_ROOT = DEFAULT_EXPORT_EXCLUDE_ROOT = frozenset({
     # Infrastructure
     "hermes-agent",         # repo checkout (multi-GB)
     ".worktrees",           # git worktrees

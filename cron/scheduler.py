@@ -4037,20 +4037,61 @@ def _get_session_db_timeout() -> float:
     return 10.0
 
 
-def _read_windows_pyvenv_cfg(venv_dir: Path) -> dict[str, str]:
-    cfg_path = venv_dir / "pyvenv.cfg"
-    try:
-        lines = cfg_path.read_text(encoding="utf-8-sig").splitlines()
-    except OSError:
-        return {}
+def _pm_runtime_venv_dir() -> Optional[Path]:
+    """The venv pm provisioned for this install, resolved from pm's own
+    records (facts.json + store layout) — never from interpreter state.
 
-    parsed: dict[str, str] = {}
-    for raw in lines:
-        if "=" not in raw:
-            continue
-        key, value = raw.split("=", 1)
-        parsed[key.strip().lower()] = value.strip()
-    return parsed
+    Under no-boot-through-venv the scheduler process is the store python
+    (``sys.prefix == sys.base_prefix``) and ``VIRTUAL_ENV`` is unset in
+    bundled installs, so prefix/env probing has nothing to offer. pm is
+    the authority: a bundled install keeps its relocatable venv beside the
+    manifest (a sibling of the store), a dev install syncs the project
+    venv (``venv``/``.venv`` — the same layout
+    ``pm.packages.Venv.venv_dir`` materializes). The venv fact must exist:
+    pm only vouches for what it provisioned.
+    """
+    try:
+        from pm import paths
+        from pm.lock import Facts
+    except Exception:
+        return None
+    try:
+        if not Facts(paths.facts_path()).get("venv"):
+            return None
+    except Exception:
+        return None
+    store = paths.store_root()
+    bundled = store.parent / "venv"
+    if (store.parent / "manifest.json").is_file():
+        return bundled if bundled.is_dir() else None
+    try:
+        from hermes_constants import project_venv_dir
+    except ImportError:
+        return None
+    return project_venv_dir(paths.repo_root())
+
+
+def _pm_store_python_exe() -> Optional[Path]:
+    """The base interpreter pm staged for this install (the ``python``
+    fact's store entry), or None. This is the store python — never a venv
+    launcher — so it is the right interpreter to run cron scripts with the
+    venv overlaid via environment (see
+    ``_windows_cron_python_invocation``)."""
+    try:
+        from pm import paths
+        from pm.lock import Facts
+    except Exception:
+        return None
+    try:
+        fact = Facts(paths.facts_path()).get("python")
+        if not fact or "entry" not in fact:
+            return None
+        exe = paths.store_root() / fact["entry"] / (
+            "python.exe" if sys.platform == "win32" else "bin/python3"
+        )
+        return exe if exe.is_file() else None
+    except Exception:
+        return None
 
 
 def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str]]:
@@ -4059,15 +4100,16 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     Cron scripts capture stdout/stderr, so using ``pythonw.exe`` directly can
     lose script output.  uv-created venv ``python.exe`` launchers are also a
     problem: even with CREATE_NO_WINDOW, the launcher can re-exec the base
-    console interpreter and flash a visible window.  For uv venvs, bypass the
-    launcher and run the base ``python.exe`` directly with the venv paths
-    overlaid in the environment.
+    console interpreter and flash a visible window.  When pm has provisioned
+    a runtime venv (facts/store resolution — never pyvenv.cfg, which is
+    dead config under no-boot-through-venv), bypass the launcher and run
+    the pm store python directly with the venv paths overlaid in the
+    environment.
     """
     if sys.platform != "win32":
         return python_exe, {}
 
     interpreter = Path(python_exe)
-    venv_dir = interpreter.parent.parent
     env_overlay: dict[str, str] = {}
 
     if interpreter.name.lower() == "pythonw.exe":
@@ -4075,22 +4117,20 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
         if sibling.exists():
             interpreter = sibling
 
-    cfg = _read_windows_pyvenv_cfg(venv_dir)
-    home = cfg.get("home", "")
-    site_packages = venv_dir / "Lib" / "site-packages"
-    if "uv" in cfg and home:
-        base_python = Path(home) / "python.exe"
-        if base_python.exists() and site_packages.exists():
-            interpreter = base_python
-            env_overlay["VIRTUAL_ENV"] = str(venv_dir)
-            pythonpath_entries = [
-                str(Path(__file__).resolve().parents[1]),
-                str(site_packages),
-            ]
-            existing_pythonpath = os.environ.get("PYTHONPATH", "")
-            if existing_pythonpath:
-                pythonpath_entries.append(existing_pythonpath)
-            env_overlay["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+    venv_dir = _pm_runtime_venv_dir()
+    base_python = _pm_store_python_exe()
+    site_packages = venv_dir / "Lib" / "site-packages" if venv_dir else None
+    if base_python is not None and site_packages is not None and site_packages.exists():
+        interpreter = base_python
+        env_overlay["VIRTUAL_ENV"] = str(venv_dir)
+        pythonpath_entries = [
+            str(Path(__file__).resolve().parents[1]),
+            str(site_packages),
+        ]
+        existing_pythonpath = os.environ.get("PYTHONPATH", "")
+        if existing_pythonpath:
+            pythonpath_entries.append(existing_pythonpath)
+        env_overlay["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
 
     return str(interpreter), env_overlay
 
@@ -4248,8 +4288,10 @@ def _windows_cron_bootstrap_argv(
     the pre-existing PYTHONPATH behaviour is strictly better than failing
     to run at all.
     """
-    site_packages = Path(env_overlay.get("VIRTUAL_ENV", "")) / "Lib" / "site-packages"
-    if not site_packages.is_dir():
+    venv_value = env_overlay.get("VIRTUAL_ENV", "")
+    venv_dir = Path(venv_value) if venv_value else _pm_runtime_venv_dir()
+    site_packages = venv_dir / "Lib" / "site-packages" if venv_dir else None
+    if site_packages is None or not site_packages.is_dir():
         # Silent here would make the "editable installs invisible" failure
         # undiagnosable; the pre-existing PYTHONPATH-only behaviour applies.
         logger.warning(
@@ -4364,14 +4406,19 @@ def _run_job_script(
     # choice explicit here keeps the allowed surface small and auditable.
     suffix = path.suffix.lower()
     if suffix in {".sh", ".bash"}:
-        # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
-        # all work.  On native Windows without Git for Windows installed
-        # shutil.which returns None — fall back to a clear error rather
+        # Resolve bash dynamically so Windows (Git for Windows) and
+        # Linux/macOS all work — through pm.shell, the one bash authority
+        # (it prefers conventional installs over MSIX-package aliases,
+        # which only spawn inside their package context). On native
+        # Windows without any bash — fall back to a clear error rather
         # than a FileNotFoundError with a confusing "[WinError 2]"
         # traceback.
-        _bash = shutil.which("bash") or (
-            "/bin/bash" if os.path.isfile("/bin/bash") else None
-        )
+        try:
+            from pm.shell import bash as _pm_bash
+
+            _bash = _pm_bash()
+        except Exception:
+            _bash = None
         if _bash is None:
             return False, (
                 f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "

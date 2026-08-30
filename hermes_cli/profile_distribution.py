@@ -95,26 +95,18 @@ DEFAULT_DIST_OWNED: Tuple[str, ...] = (
 )
 
 # Paths that are NEVER part of a distribution. These are user-owned and are
-# protected on update. Must stay consistent with
-# ``profiles.py::_DEFAULT_EXPORT_EXCLUDE_ROOT`` plus the ``local/``
-# convention for user customizations.
-USER_OWNED_EXCLUDE: frozenset = frozenset({
-    # Credentials & runtime secrets
-    "auth.json", ".env",
-    # Databases & runtime state
-    "state.db", "state.db-shm", "state.db-wal",
-    "hermes_state.db", "response_store.db",
-    "response_store.db-shm", "response_store.db-wal",
-    "gateway.pid", "gateway_state.json", "processes.json",
-    "auth.lock", "active_profile", ".update_check",
-    "errors.log", ".hermes_history",
-    # User data
-    "memories", "sessions", "logs", "plans", "workspace", "home",
-    "image_cache", "audio_cache", "document_cache",
-    "browser_screenshots", "checkpoints", "sandboxes",
+# protected on update. This is NOT a third copy of the exclude list: it is
+# the export-side authority (``profiles.py::DEFAULT_EXPORT_EXCLUDE_ROOT``)
+# plus the distribution-specific additions — user data dirs an export archive
+# may carry (memories, sessions, ...) but a distribution payload must never
+# shadow, and the ``local/`` convention for user customizations.
+from hermes_cli.profiles import DEFAULT_EXPORT_EXCLUDE_ROOT
+
+USER_OWNED_EXCLUDE: frozenset = DEFAULT_EXPORT_EXCLUDE_ROOT | frozenset({
+    # User data a distribution payload must never shadow (an export archive
+    # intentionally carries these; an install/update must not overwrite)
+    "memories", "sessions", "plans", "workspace", "home",
     "backups", "cache",
-    # Infrastructure
-    "hermes-agent", ".worktrees", "profiles", "bin", "node_modules",
     # User customization namespace
     "local",
 })

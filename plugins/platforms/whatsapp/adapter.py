@@ -355,15 +355,34 @@ def _file_content_hash(path: Path) -> str:
         return ""
 
 
+def _pm_ensure_node(command: str) -> str | None:
+    """Lazily provision node/npm through the pm store, then re-resolve.
+
+    ``find_node_executable`` prefers the pm store's pinned Node but never
+    installs it. Node/npm ship as pm packages, so when the store is empty
+    this is the pm.ensure wiring the pm-unified-toolchain plan asks for:
+    install (respecting the lazy-install policy — raises InstallError and
+    returns None when lazy installs are refused) and re-resolve.
+    """
+    try:
+        import pm
+
+        pm.ensure("node" if command == "npm" else command)
+        return find_node_executable(command)
+    except Exception:
+        return None
+
+
 def check_whatsapp_requirements() -> bool:
     """
     Check if WhatsApp dependencies are available.
-    
+
     WhatsApp requires a Node.js bridge for most implementations.
     """
     # Prefer Hermes-managed Node/npm so Windows installs are not broken by a
-    # bad or elevation-triggering system Node on PATH.
-    _node = find_node_executable("node")
+    # bad or elevation-triggering system Node on PATH. When the pm store has
+    # no Node yet, pm.ensure lazily provisions it (policy permitting).
+    _node = find_node_executable("node") or _pm_ensure_node("node")
     if not _node:
         return False
     try:
@@ -584,8 +603,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if not _deps_fresh:
                 print(f"[{self.name}] Installing WhatsApp bridge dependencies...")
                 # Resolve npm path so Windows uses npm.cmd from the
-                # Hermes-managed portable Node before falling back to PATH.
-                _npm_bin = find_node_executable("npm") or "npm"
+                # Hermes-managed portable Node before falling back to PATH;
+                # pm.ensure provisions npm when the store has none.
+                _npm_bin = find_node_executable("npm") or _pm_ensure_node("npm") or "npm"
                 try:
                     # Read timeout from environment variable, default to 300 seconds (5 minutes)
                     # to accommodate slower systems like Unraid NAS

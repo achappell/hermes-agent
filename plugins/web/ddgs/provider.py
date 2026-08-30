@@ -159,6 +159,17 @@ def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str, Any]
     from tools.environments.local import _sanitize_subprocess_env
 
     env = _sanitize_subprocess_env(dict(os.environ))
+    # No-boot-through-venv: the worker runs under the STORE python, whose
+    # third-party imports (ddgs/primp) arrive via the launcher-composed
+    # PYTHONPATH. The sanitizer strips Hermes-owned entries (cross-version
+    # protection); this worker is the SAME interpreter, so merge the
+    # ambient PYTHONPATH back in before prepending the plugins entry.
+    _ambient_pp = os.environ.get("PYTHONPATH")
+    if _ambient_pp:
+        _current = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            _ambient_pp + os.pathsep + _current if _current else _ambient_pp
+        )
     if _test_hook:
         env["HERMES_DDGS_ALLOW_TEST_HOOKS"] = "1"
 

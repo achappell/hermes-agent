@@ -57,6 +57,19 @@ def icon_path(project_root: Path) -> Path:
     return project_root / "apps" / "desktop" / "assets" / "icon.png"
 
 
+def _repo_pythonpath_entry() -> str | None:
+    """The repo root as a PYTHONPATH entry — under no-boot-through-venv the
+    boot interpreter is the pm STORE python whose imports arrive via
+    PYTHONPATH (no editable install), and a .desktop launch by the DE
+    inherits NO environment, so the Exec line must carry it explicitly."""
+    try:
+        import hermes_cli
+
+        return str(Path(hermes_cli.__file__).resolve().parent.parent)
+    except Exception:
+        return None
+
+
 def resolve_exec_command() -> str:
     """Build the absolute ``Exec=`` command line for ``hermes desktop``.
 
@@ -66,6 +79,8 @@ def resolve_exec_command() -> str:
     """
     from hermes_cli.relaunch import resolve_hermes_bin
 
+    repo = _repo_pythonpath_entry()
+    prefix = f"env PYTHONPATH={_quote_exec_arg(repo)} " if repo else ""
     bin_path = resolve_hermes_bin()
     if bin_path:
         resolved = Path(bin_path).resolve()
@@ -79,11 +94,13 @@ def resolve_exec_command() -> str:
             # sys.executable is the interpreter actually running Hermes (the
             # venv one), so prefix it explicitly.
             argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            return prefix + " ".join(_quote_exec_arg(a) for a in argv)
         else:
             argv = [str(resolved), "desktop"]
+            return " ".join(_quote_exec_arg(a) for a in argv)
     else:
         argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
-    return " ".join(_quote_exec_arg(a) for a in argv)
+        return prefix + " ".join(_quote_exec_arg(a) for a in argv)
 
 
 def _needs_interpreter(bin_path: Path) -> bool:

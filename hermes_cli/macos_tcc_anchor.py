@@ -147,7 +147,7 @@ def _interpreter_source(venv_dir: Path) -> str | None:
         return None
     home = ""
     try:
-        for line in cfg.read_text(encoding="utf-8").splitlines():
+        for line in cfg.read_text(encoding="utf-8-sig").splitlines():
             if line.lower().startswith("home"):
                 _, _, home = line.partition("=")
                 home = home.strip()
@@ -390,7 +390,7 @@ def ensure_tcc_anchor(project_root: Path | None = None) -> Path | None:
     if not venv_py.is_symlink():
         marker = _anchor_marker(venv_py.parent)
         try:
-            if marker.is_file() and marker.read_text(encoding="utf-8").strip() == (
+            if marker.is_file() and marker.read_text(encoding="utf-8-sig").strip() == (
                 _marker_value(source_file)
             ):
                 _provision_libpython(venv_dir, source_file, refresh=False)
@@ -436,7 +436,7 @@ def tcc_anchor_state(project_root: Path | None = None) -> tuple[str, str]:
         source_file = _interpreter_file(source)
         expected = _marker_value(source_file) if source_file is not None else source
         try:
-            if marker.is_file() and marker.read_text(encoding="utf-8").strip() == expected:
+            if marker.is_file() and marker.read_text(encoding="utf-8-sig").strip() == expected:
                 return "active", str(venv_py)
         except OSError:
             pass

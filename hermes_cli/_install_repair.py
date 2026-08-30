@@ -11,9 +11,9 @@ Both callers need to run the same core ``.[all]`` reinstall:
 
 This module is deliberately **stdlib-only** so importing it can never fail in
 the corrupted-venv state it exists to repair. ``hermes_cli.main`` imports
-``managed_uv``, ``hermes_constants``, and friends only in its late path; the
-early path must not. Where the late path uses ``managed_uv.ensure_uv`` to
-bootstrap uv if missing, the early path uses the stdlib
+``pm``, ``hermes_constants``, and friends only in its late path; the
+early path must not. Where the late path uses ``pm.uv()`` to
+realize uv if missing, the early path uses the stdlib
 :func:`hermes_cli._early_recovery._find_uv_binary` lookup and falls back to
 plain pip when uv is absent — a degraded but working installer (the late
 recovery will bootstrap uv on the next launch if it ever matters).
@@ -24,7 +24,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -39,19 +38,6 @@ def _is_windows() -> bool:
     return sys.platform == "win32"
 
 
-def _is_termux_env(env: dict | None = None) -> bool:
-    """Stdlib Termux probe (hermes_cli.main's version lives behind imports)."""
-    env = env if env is not None else os.environ
-    try:
-        if env.get("TERMUX_VERSION"):
-            return True
-        prefix = env.get("PREFIX", "")
-        return "com.termux" in prefix
-    except Exception:
-        return False
-
-
-@contextlib.contextmanager
 def _stdout_to_stderr():
     """Route fd 1 (and sys.stdout) to stderr for the duration of an install.
 
@@ -85,20 +71,14 @@ def _stdout_to_stderr():
 def _resolve_install_target(root: Path) -> tuple[list[str], dict | None]:
     """(install_cmd_prefix, env) for the project venv — stdlib uv lookup.
 
-    Mirrors ``main.py::_default_venv_install_target`` but without
-    ``managed_uv``. ``VIRTUAL_ENV`` steers ``uv pip`` at the project venv even
+    Mirrors ``main.py::_default_venv_install_target`` but without ``pm``. ``VIRTUAL_ENV`` steers ``uv pip`` at the project venv even
     when invoked from the base interpreter (the early-recovery case).
-    Termux strips leaked interpreter-path env vars so uv resolves the venv
-    correctly.
     """
     uv_bin = _er._find_uv_binary()
     if uv_bin:
         from hermes_constants import project_venv_dir
 
         env = {**os.environ, "VIRTUAL_ENV": str(project_venv_dir(root) or root / "venv")}
-        if _is_termux_env(env):
-            env.pop("PYTHONPATH", None)
-            env.pop("PYTHONHOME", None)
         return [uv_bin, "pip"], env
     return [sys.executable, "-m", "pip"], None
 
@@ -120,34 +100,9 @@ def _venv_scripts_dir(root: Path) -> Path | None:
 
 #: Launcher command names install.ps1's Set-PathVariable exposes from the
 #: managed binary dir (the default Hermes root's ``bin``, next to uv.exe)
-#: on the user PATH. Keep in lockstep with the launcher list in
-#: scripts/install.ps1.
+#: on the user PATH. Keep in lockstep with WINDOWS_BIN_LAUNCHERS in
+#: hermes_cli/_launchers.py and scripts/install.ps1.
 _WINDOWS_BIN_LAUNCHERS = ("hermes", "hermes-acp")
-
-
-def _venv_is_relocatable(venv_dir: Path) -> bool:
-    """True when the venv's pyvenv.cfg declares ``relocatable = true``.
-
-    uv writes the flag; ``hermes_cli.managed_uv`` builds its replacement
-    venvs with ``--relocatable`` (they are constructed aside and swapped
-    into place). A relocatable venv's console-script trampolines embed a
-    RELATIVE interpreter reference, so a COPY of one placed outside
-    ``venv\\Scripts`` fails at run time with ``uv trampoline failed to
-    canonicalize script path``. Non-relocatable venvs (fresh installs)
-    embed the absolute interpreter path and their trampolines survive
-    copying. This flag decides which launcher form a PATH dir gets.
-    """
-    try:
-        cfg = (Path(venv_dir) / "pyvenv.cfg").read_text(
-            encoding="utf-8", errors="replace"
-        )
-    except OSError:
-        return False
-    for line in cfg.splitlines():
-        key, _, value = line.partition("=")
-        if key.strip().lower() == "relocatable" and value.strip().lower() == "true":
-            return True
-    return False
 
 
 def _normalize_windows_path(value) -> str:
@@ -185,11 +140,15 @@ def ensure_windows_bin_launchers(
     windows: bool | None = None,
     user_path_entries: list[str] | None = None,
 ) -> list[str]:
-    """Re-stage the Windows ``hermes`` launchers when they vanish.
+    """Re-stage the Windows ``hermes`` launchers when they vanish or when
+    they still boot through the venv.
 
-    On Windows, ``hermes`` resolves through launchers derived from the venv
-    console scripts — never ``venv\\Scripts`` itself on PATH, which would
-    shadow the user's ``python`` (#83797). The canonical launcher home is
+    On Windows, ``hermes`` resolves through staged launchers — never
+    ``venv\\Scripts`` itself on PATH, which would shadow the user's
+    ``python`` (#83797) — and under pm the launchers boot the pm STORE
+    python with ``PYTHONPATH=<repo>;<venv>/site-packages``, never the venv
+    interpreter (no-boot-through-venv; ``pyvenv.cfg`` is inert dead
+    config). The canonical launcher home is
     the managed binary dir — the default Hermes root's ``bin``
     (``%LOCALAPPDATA%\\hermes\\bin``, next to the managed uv) — which lives
     OUTSIDE the git checkout so no git operation can ever touch it. It is
@@ -205,15 +164,10 @@ def ensure_windows_bin_launchers(
     terminal. That legacy location is re-staged too, during the transition,
     for installs whose user PATH still resolves through it.
 
-    The launcher FORM depends on the venv (see :func:`_venv_is_relocatable`):
-    a normal venv's exe trampoline embeds an absolute interpreter path and
-    survives copying, so it is copied as ``<name>.exe``; a relocatable
-    venv's trampoline resolves relative to its own location and a copy
-    dies with ``uv trampoline failed to canonicalize script path``, so a
-    ``<name>.cmd`` delegator invoking the in-venv exe by absolute path is
-    written instead. A name counts as present when EITHER form exists —
-    exe copies staged before a venv rebuild keep working (they embed the
-    swapped-in-place venv's absolute path) and are left alone.
+    A name counts as present when an exe exists that does NOT boot the
+    venv interpreter — legacy copied-venv trampolines (detected by their
+    embedded interpreter path) and placeholder .cmd delegators are replaced
+    with a store-python launcher as soon as one can be minted.
 
     Two targets, two gates, both failing toward inaction:
 
@@ -251,6 +205,36 @@ def ensure_windows_bin_launchers(
     def _launcher_present(target: Path, name: str) -> bool:
         return (target / f"{name}.exe").exists() or (target / f"{name}.cmd").exists()
 
+    # Launchers boot the pm STORE python with PYTHONPATH=repo;site-packages
+    # — never the venv interpreter (no boot through the venv; pyvenv.cfg is
+    # inert dead config). mint_launcher prefers a distlib exe trampoline
+    # bound to the store python; a runtime-resolving .cmd is written when
+    # the store has not materialized a python yet, and the repair upgrades
+    # it (and any legacy copied-venv trampoline) to the exe once the store
+    # python exists. See hermes_cli/_launchers.py.
+    from hermes_cli._launchers import (
+        exe_is_venv_bound,
+        mint_launcher,
+        resolve_store_python,
+        stage_launcher,
+        venv_site_packages,
+    )
+
+    from hermes_constants import project_venv_dir
+
+    venv_dir = project_venv_dir(root)
+    site_packages = venv_site_packages(venv_dir) if venv_dir else None
+
+    store_python = resolve_store_python(root)
+
+    def _needs_attention(target: Path, name: str) -> bool:
+        """Missing, a placeholder .cmd, or a launcher that still boots the
+        venv interpreter — anything the store-python launcher should replace."""
+        exe = target / f"{name}.exe"
+        if not exe.exists():
+            return True
+        return exe_is_venv_bound(exe, venv_dir)
+
     targets: list[Path] = []
 
     # Canonical target — gate on the managed-clone shape. This runs at
@@ -258,7 +242,9 @@ def ensure_windows_bin_launchers(
     # override), so the healthy path must stay at a couple of stat calls.
     if _normalize_windows_path(root.parent) == _normalize_windows_path(home):
         canonical = home / "bin"
-        if any(not _launcher_present(canonical, name) for name in _WINDOWS_BIN_LAUNCHERS):
+        if any(
+            _needs_attention(canonical, name) for name in _WINDOWS_BIN_LAUNCHERS
+        ):
             targets.append(canonical)
 
     # Legacy transition target — the pre-migration in-checkout dir. Only
@@ -268,7 +254,7 @@ def ensure_windows_bin_launchers(
     # network shares. An entry stored some other way (8.3 short path,
     # subst drive) misses the re-stage, which fails safe: no-op.
     legacy = root / "bin"
-    if any(not _launcher_present(legacy, name) for name in _WINDOWS_BIN_LAUNCHERS):
+    if any(_needs_attention(legacy, name) for name in _WINDOWS_BIN_LAUNCHERS):
         if user_path_entries is None:
             user_path_entries = _windows_user_path_entries()
         configured = {_normalize_windows_path(entry) for entry in user_path_entries}
@@ -278,44 +264,23 @@ def ensure_windows_bin_launchers(
     if not targets:
         return []
 
-    from hermes_constants import project_venv_dir, venv_bin_dir
-
-    venv_dir = project_venv_dir(root)
-    if venv_dir is None:
-        return []
-    scripts_dir = venv_bin_dir(venv_dir, windows=windows)
-    sources = [
-        (name, scripts_dir / f"{name}.exe")
-        for name in _WINDOWS_BIN_LAUNCHERS
-        if (scripts_dir / f"{name}.exe").is_file()
-    ]
-    if not sources:
-        return []
-    relocatable = _venv_is_relocatable(venv_dir)
-
     restored: list[str] = []
     for target in targets:
         try:
             target.mkdir(parents=True, exist_ok=True)
         except OSError:
             continue
-        for name, source in sources:
-            if _launcher_present(target, name):
+        for name in _WINDOWS_BIN_LAUNCHERS:
+            if not _needs_attention(target, name):
+                # Already a store-python launcher (or a form this heal does
+                # not understand but that does not boot the venv): leave it.
                 continue
-            final = target / (f"{name}.cmd" if relocatable else f"{name}.exe")
-            staging = target / f"{final.name}.heal.{os.getpid()}"
-            try:
-                if relocatable:
-                    staging.write_text(
-                        "@echo off\r\n" f'"{source}" %*\r\n', encoding="ascii"
-                    )
-                else:
-                    shutil.copy2(source, staging)
-                os.replace(staging, final)
+            if store_python is not None:
+                final = mint_launcher(name, root, target, store_python, site_packages)
+            else:
+                final = stage_launcher(name, root, target)
+            if final is not None:
                 restored.append(str(final))
-            except OSError:
-                with contextlib.suppress(OSError):
-                    staging.unlink()
     if restored:
         # Guarded like everything else in this never-raises helper: a
         # closed/broken stderr must not turn a successful heal into a crash.
@@ -573,7 +538,7 @@ def _run_install_cmd(cmd: list[str], *, env: dict | None, root: Path) -> None:
 
 
 def _load_installable_optional_extras(root: Path, group: str) -> list[str]:
-    """Optional extras referenced by a dependency group (all / termux-all)."""
+    """Optional extras referenced by a dependency group (all)."""
     try:
         import tomllib
 
@@ -604,17 +569,16 @@ def run_core_install(root: Path) -> None:
       pip module at all)
     - prefer ``uv pip`` with VIRTUAL_ENV pointed at the project venv; fall back
       to ``python -m pip`` when no uv binary is available
-    - target ``.[all]`` (or ``.[termux-all]`` on Termux) with the per-extra
-      fallback ladder when the combined extras resolve fails
+    - target ``.[all]`` with the per-extra fallback ladder when the combined
+      extras resolve fails
     - quarantine live ``hermes*.exe`` shims on Windows so they can be replaced
     - route ALL install output to stderr (acp/JSON-RPC safety)
-    - Termux strips leaked PYTHONPATH/PYTHONHOME from the uv env
 
     Raises ``subprocess.CalledProcessError`` when even the base install fails;
     callers own marker lifecycle (clear on success, keep on failure).
     """
     prefix, env = _resolve_install_target(root)
-    group = "termux-all" if _is_termux_env(env) else "all"
+    group = "all"
 
     with _stdout_to_stderr():
         try:
@@ -676,7 +640,7 @@ def bump_marker_attempts(marker_path: Path) -> int:
     """
     attempts = 0
     try:
-        raw = marker_path.read_text(encoding="utf-8", errors="replace").strip()
+        raw = marker_path.read_text(encoding="utf-8-sig", errors="replace").strip()
         if raw:
             try:
                 attempts = int(json.loads(raw).get("attempts", 0))

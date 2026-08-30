@@ -92,9 +92,17 @@ __all__ = [
 # ``Thread.join(timeout=...)`` deadlines to an absolute timestamp; very large
 # relative timeouts overflow ``time_t`` on macOS and raise
 # ``OverflowError: timestamp out of range for platform time_t`` (#83220).
-# One year is semantically "unbounded" for every wait in this codebase while
-# staying far below any platform conversion limit.
-MAX_SAFE_TIMEOUT_S = 31_536_000.0  # 365 days
+# On Windows the binding constraint is narrower: the underlying
+# ``WaitForSingleObject`` takes a DWORD *milliseconds* argument, so any
+# wait above ~49.7 days (0xFFFFFFFF ms) raises OverflowError rather than
+# waiting (verified live: 4294967.0s ok, 4294967.3s overflows). One year
+# is the semantic "unbounded" on platforms that can express it; Windows
+# takes the DWORD-ms cap, which is still semantically "unbounded" for
+# every wait in this codebase.
+_WINDOWS_MAX_WAIT_S = (0xFFFFFFFF - 1000) / 1000.0  # DWORD ms, minus a 1s rounding guard
+MAX_SAFE_TIMEOUT_S = (
+    _WINDOWS_MAX_WAIT_S if sys.platform == "win32" else 31_536_000.0
+)  # 365 days off-Windows
 
 # Grace period after a deadline fires before concluding the event loop thread
 # is blocked in a synchronous call and dumping stacks (family A diagnostics).

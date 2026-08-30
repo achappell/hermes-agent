@@ -417,7 +417,10 @@ def _(rid, params: dict) -> dict:
     try:
         # CREATE_NO_WINDOW on Windows — under the desktop GUI's windowless
         # parent, this spawn otherwise flashes a console (#56747).
-        from hermes_cli._subprocess_compat import windows_hide_flags
+        from hermes_cli._subprocess_compat import (
+            restore_ambient_pythonpath,
+            windows_hide_flags,
+        )
 
         r = subprocess.run(
             [sys.executable, "-m", "hermes_cli.main", *argv],
@@ -431,7 +434,11 @@ def _(rid, params: dict) -> dict:
             cwd=os.getcwd(),
             # cli.exec runs `python -m hermes_cli.main` (can drive the agent) →
             # needs provider credentials. Tier-1 secrets still stripped (#29157).
-            env=hermes_subprocess_env(inherit_credentials=True),
+            # Same-interpreter re-exec: ambient PYTHONPATH must survive the
+            # env factory's Hermes-owned strip (no-boot-through-venv).
+            env=restore_ambient_pythonpath(
+                hermes_subprocess_env(inherit_credentials=True)
+            ),
             stdin=subprocess.DEVNULL,
             creationflags=windows_hide_flags(),
         )

@@ -338,10 +338,10 @@ _LONG_HANDLERS = frozenset(
         "voice.record",
         "voice.tts",
         # wake.start calls check_wake_word_requirements() → _stt_ready() →
-        # _get_provider() → _try_lazy_install_stt() → ensure("stt.faster_whisper")
+        # _get_provider() → _try_lazy_install_stt() → ensure("stt-whisper")
         # (same synchronous subprocess install chain as the voice RPCs above).
         # It also calls start_listening() → _build_engine() whose constructors
-        # call lazy_deps.ensure("wake.openwakeword" / "wake.sherpa" / …).
+        # call pm.ensure_import("wake-*" / …).
         # wake.status calls check_wake_word_requirements() too and is polled
         # by the desktop on every gateway-ready, so it can re-trigger the
         # same block on a fresh launch. Same bug class as #21123 / #50005.
@@ -466,8 +466,10 @@ class _SlashWorker:
             argv += ["--model", model]
 
         self._closed = False
-        from hermes_cli._subprocess_compat import windows_hide_flags
-
+        from hermes_cli._subprocess_compat import (
+            restore_ambient_pythonpath,
+            windows_hide_flags,
+        )
         # slash_worker runs the Hermes agent → needs provider credentials.
         # Tier-1 secrets (gateway/GitHub/infra) are still stripped (#29157).
         # Global-remote / multi-profile sessions: the worker must resolve
@@ -482,6 +484,11 @@ class _SlashWorker:
             inherit_profile_home=False,  # base already carries the HOME contract
             extra={"HERMES_HOME": str(profile_home)} if profile_home else None,
         )
+        # Same-interpreter re-exec (sys.executable -m tui_gateway...): the
+        # ambient PYTHONPATH must survive the env factory's Hermes-owned
+        # strip — under no-boot-through-venv the child's imports arrive
+        # through it (no editable install on the store python).
+        env = restore_ambient_pythonpath(env)
         # Prepend the Hermes venv bin dir and the user-local bin dir to PATH so
         # slash_worker child processes can resolve Hermes-managed CLIs
         # (browser-use, uvx) even when the parent gateway was launched with a

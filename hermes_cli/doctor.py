@@ -706,7 +706,7 @@ def _read_pyproject_version() -> str | None:
     """
     pyproject = PROJECT_ROOT / "pyproject.toml"
     try:
-        text = pyproject.read_text(encoding="utf-8")
+        text = pyproject.read_text(encoding="utf-8-sig")
     except OSError:
         return None
     in_project = False
@@ -1232,6 +1232,34 @@ def check_macos_full_disk_access() -> None:
     )
 
 
+def _pm_venv_active() -> bool:
+    """Whether pm provisioned a runtime venv for this install.
+
+    Resolved from pm's own records (facts.json + store layout), never from
+    interpreter state: under no-boot-through-venv ``sys.prefix`` always
+    equals ``sys.base_prefix`` and ``VIRTUAL_ENV`` is unset in bundled
+    installs. A bundled install keeps its relocatable venv beside the
+    manifest; a dev install syncs the project venv (``venv``/``.venv``).
+    Falls back to the legacy ``sys.prefix`` probe when pm records nothing
+    here (pre-pm checkouts) or pm itself cannot be read.
+    """
+    try:
+        from pm import paths
+        from pm.lock import Facts
+
+        if Facts(paths.facts_path()).get("venv"):
+            store = paths.store_root()
+            bundled = store.parent / "venv"
+            if (store.parent / "manifest.json").is_file():
+                return bundled.is_dir()
+            from hermes_constants import project_venv_dir
+
+            return project_venv_dir(paths.repo_root()) is not None
+    except Exception:
+        pass
+    return sys.prefix != sys.base_prefix
+
+
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
@@ -1395,8 +1423,12 @@ def run_doctor(args):
         _report_database_journal_modes()
     except Exception as e:
         check_warn(f"SQLite version probe failed: {e}")
-    # Check if in virtual environment
-    in_venv = sys.prefix != sys.base_prefix
+    # Check whether pm provisioned a runtime venv for this install.
+    # Under no-boot-through-venv the gateway runs the store python
+    # (sys.prefix == sys.base_prefix always, VIRTUAL_ENV unset in bundled
+    # installs), so prefix sniffing cannot distinguish; pm's facts are the
+    # authority. Falls back to the legacy probe when pm has no venv here.
+    in_venv = _pm_venv_active()
     if in_venv:
         check_ok("Virtual environment active")
     else:
@@ -1464,7 +1496,7 @@ def run_doctor(args):
         # latin-1 for Windows Notepad/cp1252 files that are not valid UTF-8 —
         # matches hermes_cli.env_loader._load_dotenv_with_fallback.
         try:
-            content = env_path.read_text(encoding="utf-8")
+            content = env_path.read_text(encoding="utf-8-sig")
         except UnicodeDecodeError:
             content = env_path.read_text(encoding="latin-1")
         if _has_provider_env_config(content):
@@ -1995,7 +2027,7 @@ def run_doctor(args):
     # Check for SOUL.md persona file
     soul_path = hermes_home / "SOUL.md"
     if soul_path.exists():
-        content = soul_path.read_text(encoding="utf-8").strip()
+        content = soul_path.read_text(encoding="utf-8-sig").strip()
         # Check if it's just the template comments (no real content)
         lines = [l for l in content.splitlines() if l.strip() and not l.strip().startswith(("<!--", "-->", "#"))]
         if lines:
@@ -2022,12 +2054,12 @@ def run_doctor(args):
         memory_file = memories_dir / "MEMORY.md"
         user_file = memories_dir / "USER.md"
         if memory_file.exists():
-            size = len(memory_file.read_text(encoding="utf-8").strip())
+            size = len(memory_file.read_text(encoding="utf-8-sig").strip())
             check_ok(f"MEMORY.md exists ({size} chars)")
         else:
             check_info("MEMORY.md not created yet (will be created when the agent first writes a memory)")
         if user_file.exists():
-            size = len(user_file.read_text(encoding="utf-8").strip())
+            size = len(user_file.read_text(encoding="utf-8-sig").strip())
             check_ok(f"USER.md exists ({size} chars)")
         else:
             check_info("USER.md not created yet (will be created when the agent first writes a memory)")
@@ -3178,7 +3210,7 @@ def run_doctor(args):
         if lock_file.exists():
             try:
                 import json
-                lock_data = json.loads(lock_file.read_text(encoding="utf-8"))
+                lock_data = json.loads(lock_file.read_text(encoding="utf-8-sig"))
                 count = len(lock_data.get("installed", {}))
                 check_ok(f"Lock file OK ({count} hub-installed skill(s))")
             except Exception:
@@ -3344,7 +3376,7 @@ def run_doctor(args):
                     if not wrapper.is_file():
                         continue
                     try:
-                        content = wrapper.read_text(encoding="utf-8")
+                        content = wrapper.read_text(encoding="utf-8-sig")
                         if "hermes -p" in content:
                             _m = _re.search(r"hermes -p (\S+)", content)
                             if _m and not profile_exists(_m.group(1)):

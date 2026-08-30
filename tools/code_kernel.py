@@ -572,7 +572,7 @@ def _spawn(kernel: SessionKernel, *, task_id: str, child_python: str,
     kernel.server_sock = server_sock
 
     tools_src = generate_hermes_tools_module(list(sandbox_tools))
-    with open(os.path.join(kernel.tmpdir, "hermes_tools.py"), "w", encoding="utf-8") as f:
+    with open(os.path.join(kernel.tmpdir, "hermes_tools.py"), "w", encoding="utf-8-sig") as f:
         f.write(tools_src)
     runner_path = os.path.join(kernel.tmpdir, "hermes_kernel_runner.py")
     with open(runner_path, "w", encoding="utf-8") as f:

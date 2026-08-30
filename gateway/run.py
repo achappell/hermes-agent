@@ -32272,7 +32272,42 @@ def main():
         with open(args.config, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
             config = GatewayConfig.from_dict(data)
-    
+
+
+    # Post-update boot bootstrap: when this install's code changed since the
+    # last boot (app-updater swap, docker/nix image change, git pull without
+    # `hermes update`), run the idempotent user-state steps (config
+    # migration, skills sync, state.db guard) before platforms connect.
+    # Two file reads when nothing changed; never raises.
+    try:
+        from pathlib import Path as _Path
+
+        from hermes_cli.boot_bootstrap import maybe_run_boot_bootstrap
+
+        maybe_run_boot_bootstrap(_Path(__file__).resolve().parents[1])
+    except Exception as exc:
+        # maybe_run_boot_bootstrap itself never raises and logs internally;
+        # this guard covers the import/lookup path. Don't hide it silently.
+        logger.warning("boot bootstrap setup failed (continuing boot): %s", exc)
+
+    # pm startup: same contract as the CLI dispatch path (hermes_cli/main.py)
+    # — the gateway daemon never passes through CLI dispatch, so without this
+    # it would boot without the store's tools (git/bash/ffmpeg/...) on PATH.
+    # O(1) stamp checks, no network, no installs; warns, never blocks.
+    try:
+        import pm
+
+        pm.adopt()
+        problems = pm.check()
+        if problems:
+            logger.warning(
+                "install out of sync (%s) — run `hermes pm install`",
+                "; ".join(problems),
+            )
+        else:
+            pm.activate()
+    except Exception:
+        logger.debug("pm startup check failed", exc_info=True)
     # start_gateway() performs the full graceful teardown (adapters
     # disconnected, sessions saved + flushed, SQLite closed, cron/MCP stopped,
     # PID file + runtime lock released) before it returns OR raises SystemExit
