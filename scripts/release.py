@@ -2174,10 +2174,9 @@ def dispatch_desktop_build(tag: str, gh_repo: str | None) -> bool:
     (the workflow checks out ${{ inputs.tag }}), so an old-tag rebuild
     builds the old snapshot with the current workflow.
     """
-    dispatch_ref = _default_branch(gh_repo) or "main"
     cmd = [
         "gh", "workflow", "run", "desktop-bundled-release.yml",
-        "--ref", dispatch_ref,
+        "--ref", "main",  # placeholder — replaced after the which-guard below
         "-f", f"tag={tag}",
         "-f", "upload_release=true",
     ]
@@ -2188,6 +2187,9 @@ def dispatch_desktop_build(tag: str, gh_repo: str | None) -> bool:
         print("  ✗ Cannot start the desktop build: `gh` CLI not found.")
         print(f"    Start it manually: {' '.join(cmd)}")
         return False
+
+    dispatch_ref = _default_branch(gh_repo) or "main"
+    cmd[cmd.index("--ref") + 1] = dispatch_ref
 
     result = subprocess.run(
         cmd, capture_output=True, text=True, encoding="utf-8",

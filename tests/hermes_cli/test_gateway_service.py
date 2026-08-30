@@ -1,5 +1,6 @@
 """Tests for gateway service management helpers."""
 
+import json
 import os
 import plistlib
 import subprocess
@@ -1151,9 +1152,59 @@ class TestGatewaySystemServiceRouting:
 
 
 class TestDetectVenvDir:
-    """Tests for _detect_venv_dir() virtualenv detection."""
+    """Tests for _detect_venv_dir() virtualenv detection.
+
+    pm's facts/store resolution is the primary source; each legacy-probe
+    test isolates it (``_pm_runtime_venv_dir`` patched to None) so the
+    fallbacks are exercised deterministically regardless of whether the
+    host checkout has pm-provisioned a venv.
+    """
+
+    def test_resolves_pm_provisioned_venv_without_virtual_env(self, tmp_path, monkeypatch):
+        """No sys.prefix venv, no VIRTUAL_ENV anywhere — the pm-provisioned
+        venv (facts + store layout) is the answer."""
+        monkeypatch.setattr("sys.prefix", "/usr")
+        monkeypatch.setattr("sys.base_prefix", "/usr")
+        monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+        monkeypatch.delenv("HERMES_RUNTIME_DIR", raising=False)
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", tmp_path)
+
+        payload = tmp_path / "payload"
+        store = payload / "tools"
+        venv = payload / "venv"
+        venv.mkdir(parents=True)
+        (payload / "manifest.json").write_text("{}", encoding="utf-8")
+        (store / "facts.json").write_text(
+            json.dumps(
+                {"schema": 1, "packages": {"venv": {"stamp": "abc", "extras": []}}}
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_RUNTIME_DIR", str(store))
+
+        assert gateway_cli._detect_venv_dir() == venv
+
+    def test_pm_resolution_none_without_venv_fact(self, tmp_path, monkeypatch):
+        """A store without a venv fact does not vouch — no pm answer."""
+        monkeypatch.setattr("sys.prefix", "/usr")
+        monkeypatch.setattr("sys.base_prefix", "/usr")
+        monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+        monkeypatch.setattr(gateway_cli, "PROJECT_ROOT", tmp_path)
+
+        payload = tmp_path / "payload"
+        store = payload / "tools"
+        (payload / "venv").mkdir(parents=True)
+        (payload / "manifest.json").write_text("{}", encoding="utf-8")
+        (store / "facts.json").write_text(
+            json.dumps({"schema": 1, "packages": {}}), encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_RUNTIME_DIR", str(store))
+
+        assert gateway_cli._detect_venv_dir() is None
 
     def test_detects_active_virtualenv_via_sys_prefix(self, tmp_path, monkeypatch):
+        # Legacy probe (pre-pm environments): isolated from pm resolution.
+        monkeypatch.setattr(gateway_cli, "_pm_runtime_venv_dir", lambda: None)
         venv_path = tmp_path / "my-custom-venv"
         venv_path.mkdir()
         monkeypatch.setattr("sys.prefix", str(venv_path))
@@ -1164,6 +1215,7 @@ class TestDetectVenvDir:
 
     def test_falls_back_to_dot_venv_directory(self, tmp_path, monkeypatch):
         # Not inside a virtualenv
+        monkeypatch.setattr(gateway_cli, "_pm_runtime_venv_dir", lambda: None)
         monkeypatch.setattr("sys.prefix", "/usr")
         monkeypatch.setattr("sys.base_prefix", "/usr")
         monkeypatch.delenv("VIRTUAL_ENV", raising=False)
@@ -1177,6 +1229,7 @@ class TestDetectVenvDir:
 
 
     def test_returns_none_when_no_virtualenv(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "_pm_runtime_venv_dir", lambda: None)
         monkeypatch.setattr("sys.prefix", "/usr")
         monkeypatch.setattr("sys.base_prefix", "/usr")
         monkeypatch.delenv("VIRTUAL_ENV", raising=False)
@@ -1184,6 +1237,35 @@ class TestDetectVenvDir:
 
         result = gateway_cli._detect_venv_dir()
         assert result is None
+
+
+class TestServicePathDirsPmVenv:
+    """_build_service_path_dirs() must derive the venv bin dir from pm's
+    facts/store resolution, not from sys.prefix sniffing (which degrades
+    under no-boot-through-venv, where sys.prefix == sys.base_prefix)."""
+
+    def test_includes_pm_venv_bin_without_sys_prefix_venv(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("sys.prefix", "/usr")
+        monkeypatch.setattr("sys.base_prefix", "/usr")
+        monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+        monkeypatch.delenv("HERMES_RUNTIME_DIR", raising=False)
+
+        payload = tmp_path / "payload"
+        store = payload / "tools"
+        venv_bin = payload / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        (payload / "manifest.json").write_text("{}", encoding="utf-8")
+        (store / "facts.json").write_text(
+            json.dumps(
+                {"schema": 1, "packages": {"venv": {"stamp": "abc", "extras": []}}}
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_RUNTIME_DIR", str(store))
+
+        dirs = gateway_cli._build_service_path_dirs(project_root=tmp_path / "project")
+
+        assert str(venv_bin) in dirs
 
 
 def _seed_pm_node_facts(hermes_root):

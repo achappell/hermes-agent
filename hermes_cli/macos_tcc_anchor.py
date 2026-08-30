@@ -50,7 +50,7 @@ import tempfile
 from pathlib import Path
 
 from hermes_constants import venv_python_path
-from hermes_cli.managed_uv import _RUNTIME_DIR_NAME
+from hermes_cli.runtime_repair import _RUNTIME_DIR_NAME
 from utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 _MARKER_NAME = ".tcc-anchor-source"
 
 _STORE_COMMON_MARKERS = ("cpython-", "-macos-")
-# The runtime-store marker is derived from managed_uv so a rename of the
+# The runtime-store marker is derived from runtime_repair so a rename of the
 # repair-generation directory cannot silently stop the anchor from matching.
 _STORE_ROOT_MARKERS = ("/uv/python/", f"/{_RUNTIME_DIR_NAME}/python/")
 
@@ -334,7 +334,7 @@ def _install_anchor(venv_dir: Path, source_file: Path) -> None:
         shutil.copy2(source_file, tmp_path)
         os.chmod(tmp_path, source_file.stat().st_mode | 0o111)
         try:
-            from hermes_cli.managed_uv import _macos_sign_managed_python
+            from hermes_cli.runtime_repair import _macos_sign_managed_python
 
             _macos_sign_managed_python(tmp_path)
         except Exception:  # pragma: no cover - never block the anchor
