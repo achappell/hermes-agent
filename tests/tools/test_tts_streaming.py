@@ -6,6 +6,7 @@ synth path are all mocked. Covers the registry/resolver, provider availability,
 the chunked-streamer playback path, and the universal per-sentence sync fallback.
 """
 
+import json
 import os
 import queue
 import sys
@@ -193,6 +194,40 @@ def test_qwen_streamer_advertises_and_uses_configured_alignment(monkeypatch):
         "url": "http://qwen.example/v1/audio/align",
         "timeout": 2.0,
     }
+
+
+def test_alignment_flattens_paragraph_whitespace_for_the_aligner(monkeypatch):
+    captured = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, *_args):
+            return b'{"text":"First line. Second line.","words":[]}'
+
+    def _urlopen(request, timeout):
+        captured["body"] = json.loads(request.data)
+        return _Response()
+
+    monkeypatch.setattr(ts, "urlopen", _urlopen)
+    streamer = ts.QwenStreamer(
+        {
+            "streaming": {
+                "alignment": {
+                    "url": "http://qwen.example/v1/audio/align",
+                }
+            }
+        },
+        {"base_url": "http://qwen.example/v1"},
+    )
+
+    streamer.align("First line.\n\nSecond line.", b"\x00\x00")
+
+    assert captured["body"]["input"] == "First line. Second line."
 
 
 # ── Built-in provider availability ───────────────────────────────────────

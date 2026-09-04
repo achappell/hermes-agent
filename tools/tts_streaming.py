@@ -338,9 +338,13 @@ def _request_alignment(
     except (TypeError, ValueError):
         timeout = 4.0
     timeout = min(max(timeout, 0.5), 30.0)
+    # The Caticorn Queen aligner accepts the spoken words but rejects paragraph
+    # separators.  Keep those separators in the TTS input/audio; flatten only
+    # the alignment text so a formatted response cannot silently lose timing.
+    alignment_text = " ".join(str(text).split())
     body = json.dumps(
         {
-            "input": text,
+            "input": alignment_text,
             "audio_base64": base64.b64encode(pcm).decode("ascii"),
             "sample_rate": sample_rate,
             "channels": channels,
