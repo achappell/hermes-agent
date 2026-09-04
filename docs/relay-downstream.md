@@ -42,16 +42,28 @@ binary signed 16-bit PCM after `audio_start`, and `turn_end`. The protocol has
 an interrupt operation for barge-in; it does not require binary microphone
 ingress.
 
-Alignment is optional. If the aligner is unavailable, slow, malformed, or
-disabled, the gateway continues with ordinary streamed PCM and the client’s
-audio-clock fallback.
+Alignment is optional. Each completed streamed TTS segment may carry a
+`speech_timing` record with a stable `segment_id`, normalized spoken `text`,
+absolute `audio_offset_ms`, and segment `duration_ms`. A successful record has
+`timing_source: "alignment"` and a complete validated `words` list. An
+alignment failure, timeout, malformed response, text mismatch, unsupported
+provider, or disabled experiment has `timing_source: "duration_fallback"`, an
+empty `words` list, and a bounded `fallback_reason`. Segment IDs advance with
+the audio clock, so a failed segment cannot make an earlier word track
+authoritative for later PCM.
+
+Aligned records and buffered alignment fallbacks precede their PCM. The
+disabled/unsupported low-latency path writes PCM immediately and sends its
+duration record after the segment. The gateway bounds alignment waits and
+always preserves ordinary streamed PCM and the client’s audio-clock fallback;
+it never sends partial word timing or exception text.
 
 ## Validation
 
-From this checkout:
+From this checkout, use the canonical hermetic runner:
 
 ```bash
-uv run --with pytest --with pytest-asyncio pytest -q \
+scripts/run_tests.sh \
   tests/plugins/platforms/voice_session/test_adapter.py \
   tests/gateway/test_streaming_tts_consumer.py \
   tests/gateway/test_streaming_tts_gateway_regression.py \

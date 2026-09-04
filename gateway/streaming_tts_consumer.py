@@ -327,7 +327,8 @@ class StreamingTTSConsumer:
             return
 
         cleaned = self._strip_markdown_for_tts(clause)
-        if not cleaned or not cleaned.strip():
+        text = self._normalize_spoken_text(cleaned)
+        if not text:
             return
 
         if self._streamer is None:
@@ -339,11 +340,40 @@ class StreamingTTSConsumer:
             and getattr(self._streamer, "supports_alignment", False)
             and callable(align)
         ):
-            await self._synthesise_aligned_and_write(cleaned, align)
+            await self._synthesise_aligned_and_write(text, align)
             return
 
-        async for chunk in self._iter_stream_chunks(cleaned):
-            await self._write_audio_chunk(chunk)
+        fallback_reason = "disabled" if not self._alignment_enabled else "unsupported"
+        await self._synthesise_streamed_and_write(text, fallback_reason)
+
+    async def _synthesise_streamed_and_write(
+        self,
+        text: str,
+        fallback_reason: str,
+    ) -> None:
+        """Stream PCM immediately, then publish its duration fallback record."""
+        pcm_length = 0
+        async for chunk in self._iter_stream_chunks(text):
+            if self._aborted or self._handle is None or self._handle.aborted:
+                return
+            if not chunk:
+                continue
+            chunk_bytes = bytes(chunk)
+            await self._write_audio_chunk(chunk_bytes)
+            pcm_length += len(chunk_bytes)
+
+        if (
+            pcm_length <= 0
+            or self._aborted
+            or self._handle is None
+            or self._handle.aborted
+        ):
+            return
+
+        await self._send_speech_timing(
+            self._duration_fallback_payload(text, pcm_length, fallback_reason)
+        )
+        self._advance_segment(pcm_length)
 
     async def _synthesise_aligned_and_write(self, text: str, align: Any) -> None:
         """Buffer one sentence so timing can precede its PCM on the wire."""
@@ -358,27 +388,50 @@ class StreamingTTSConsumer:
 
         pcm = b"".join(chunks)
         timing = None
+        fallback_reason = "missing"
         try:
-            timing = await asyncio.to_thread(align, text, pcm)
+            timing = await asyncio.wait_for(
+                asyncio.to_thread(align, text, pcm),
+                timeout=self._alignment_timeout_seconds(),
+            )
+        except asyncio.TimeoutError:
+            fallback_reason = "timeout"
+            logger.info("speech alignment timed out; using audio fallback")
         except Exception as exc:
             # Alignment is an experiment. A slow or broken aligner must never
             # turn a valid voice response into silence.
+            fallback_reason = "error"
             logger.info("speech alignment unavailable; using audio fallback: %s", exc)
 
         payload = self._validated_timing_payload(timing, text, len(pcm))
-        sender = getattr(self._adapter, "send_speech_timing", None)
-        if payload is not None and callable(sender):
-            try:
-                sent = await sender(self._handle, payload, metadata=self._metadata)
-                if sent is False:
-                    logger.info("speech timing event was not accepted; using audio fallback")
-            except Exception as exc:
-                logger.info("speech timing event failed; using audio fallback: %s", exc)
+        if payload is None:
+            if timing is not None and fallback_reason == "missing":
+                fallback_reason = "invalid"
+            payload = self._duration_fallback_payload(
+                text,
+                len(pcm),
+                fallback_reason,
+            )
+
+        if self._aborted or self._handle is None or self._handle.aborted:
+            return
+        await self._send_speech_timing(payload)
 
         for chunk in chunks:
             await self._write_audio_chunk(chunk)
-        self._audio_offset_ms += self._pcm_duration_ms(len(pcm))
-        self._segment_index += 1
+        self._advance_segment(len(pcm))
+
+    async def _send_speech_timing(self, payload: Dict[str, Any]) -> None:
+        """Best-effort timing delivery; PCM remains authoritative on failure."""
+        sender = getattr(self._adapter, "send_speech_timing", None)
+        if not callable(sender) or self._handle is None:
+            return
+        try:
+            sent = await sender(self._handle, payload, metadata=self._metadata)
+            if sent is False:
+                logger.info("speech timing event was not accepted; using audio fallback")
+        except Exception as exc:
+            logger.info("speech timing event failed; using audio fallback: %s", exc)
 
     async def _write_audio_chunk(self, chunk: bytes) -> None:
         if self._aborted or self._handle is None or self._handle.aborted or not chunk:
@@ -402,10 +455,18 @@ class StreamingTTSConsumer:
         if not isinstance(raw_words, list) or not raw_words:
             return None
 
+        spoken_text = self._normalize_spoken_text(text)
+        reported_text = timing.get("text")
+        if (
+            not isinstance(reported_text, str)
+            or self._normalize_spoken_text(reported_text) != spoken_text
+        ):
+            return None
+
         duration_ms = self._pcm_duration_ms(pcm_length)
         words: list[Dict[str, Any]] = []
         previous_end = 0
-        expected_words = text.split()
+        expected_words = spoken_text.split()
         if len(raw_words) != len(expected_words):
             return None
         for raw_word, expected in zip(raw_words, expected_words):
@@ -437,12 +498,56 @@ class StreamingTTSConsumer:
             )
             previous_end = int(end_ms)
 
-        turn_id = str((self._metadata or {}).get("voice_session_turn_id") or "speech")
+        turn_id = self._segment_turn_id()
         return {
             "segment_id": f"{turn_id}-tts-{self._segment_index}",
-            "text": text,
+            "text": spoken_text,
             "words": words,
+            "timing_source": "alignment",
+            "audio_offset_ms": self._audio_offset_ms,
+            "duration_ms": duration_ms,
         }
+
+    def _duration_fallback_payload(
+        self,
+        text: str,
+        pcm_length: int,
+        fallback_reason: str,
+    ) -> Dict[str, Any]:
+        """Build a complete segment record with no misleading word spans."""
+        turn_id = self._segment_turn_id()
+        return {
+            "segment_id": f"{turn_id}-tts-{self._segment_index}",
+            "text": self._normalize_spoken_text(text),
+            "words": [],
+            "timing_source": "duration_fallback",
+            "fallback_reason": fallback_reason,
+            "audio_offset_ms": self._audio_offset_ms,
+            "duration_ms": self._pcm_duration_ms(pcm_length),
+        }
+
+    def _advance_segment(self, pcm_length: int) -> None:
+        """Advance the absolute stream clock after a complete segment."""
+        self._audio_offset_ms += self._pcm_duration_ms(pcm_length)
+        self._segment_index += 1
+
+    def _segment_turn_id(self) -> str:
+        """Use the adapter's authoritative turn marker when metadata is absent."""
+        handle_turn_id = str(getattr(self._handle, "turn_id", "") or "").strip()
+        metadata_turn_id = str(
+            (self._metadata or {}).get("voice_session_turn_id") or ""
+        ).strip()
+        return handle_turn_id or metadata_turn_id or "speech"
+
+    def _alignment_timeout_seconds(self) -> float:
+        from tools.tts_streaming import speech_alignment_timeout_seconds
+
+        return speech_alignment_timeout_seconds(self._tts_config)
+
+    @staticmethod
+    def _normalize_spoken_text(text: str) -> str:
+        """Collapse formatting whitespace into the text spoken by the provider."""
+        return " ".join(str(text).split())
 
     def _pcm_duration_ms(self, pcm_length: int) -> int:
         bytes_per_second = (

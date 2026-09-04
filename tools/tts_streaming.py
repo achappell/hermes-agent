@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -41,6 +42,9 @@ logger = logging.getLogger(__name__)
 # providers (``_read_tts_response_bytes`` in tools.tts_tool): a buggy or
 # hostile endpoint must not be able to feed us unbounded audio.
 _STREAM_SENTENCE_BYTE_CAP = 16 * 1024 * 1024
+_DEFAULT_SPEECH_ALIGNMENT_TIMEOUT_SECONDS = 4.0
+_MIN_SPEECH_ALIGNMENT_TIMEOUT_SECONDS = 0.5
+_MAX_SPEECH_ALIGNMENT_TIMEOUT_SECONDS = 30.0
 
 
 def _resolve_key(env_var: str, provider_id: str) -> str:
@@ -221,6 +225,39 @@ def speech_alignment_enabled(tts_config: Dict) -> bool:
     return alignment_cfg is True
 
 
+def speech_alignment_timeout_seconds(tts_config: Dict) -> float:
+    """Return the bounded timeout shared by alignment callers.
+
+    The relay must never keep a complete PCM sentence behind an unbounded
+    alignment request. Keep this resolver tolerant of incomplete profile
+    config because alignment is an optional enhancement, not a reason to
+    reject the voice profile.
+    """
+    timeout = _DEFAULT_SPEECH_ALIGNMENT_TIMEOUT_SECONDS
+    streaming_cfg = tts_config.get("streaming") or {}
+    alignment_cfg = (
+        streaming_cfg.get("alignment") or {}
+        if isinstance(streaming_cfg, dict)
+        else {}
+    )
+    if isinstance(alignment_cfg, dict):
+        try:
+            configured = float(
+                alignment_cfg.get(
+                    "timeout_seconds",
+                    _DEFAULT_SPEECH_ALIGNMENT_TIMEOUT_SECONDS,
+                )
+            )
+        except (TypeError, ValueError):
+            configured = timeout
+        if math.isfinite(configured):
+            timeout = configured
+    return min(
+        max(timeout, _MIN_SPEECH_ALIGNMENT_TIMEOUT_SECONDS),
+        _MAX_SPEECH_ALIGNMENT_TIMEOUT_SECONDS,
+    )
+
+
 def resolve_streaming_provider(
     tts_config: Dict,
     preferred: Optional[str] = None,
@@ -333,11 +370,7 @@ def _request_alignment(
     url = _alignment_endpoint(tts_config)
     if not url:
         return None
-    try:
-        timeout = float(alignment_cfg.get("timeout_seconds", 4.0))
-    except (TypeError, ValueError):
-        timeout = 4.0
-    timeout = min(max(timeout, 0.5), 30.0)
+    timeout = speech_alignment_timeout_seconds(tts_config)
     # The Caticorn Queen aligner accepts the spoken words but rejects paragraph
     # separators.  Keep those separators in the TTS input/audio; flatten only
     # the alignment text so a formatted response cannot silently lose timing.
