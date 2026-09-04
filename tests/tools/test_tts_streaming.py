@@ -93,6 +93,67 @@ def test_never_swaps_provider_for_streaming(monkeypatch):
     assert ts.resolve_streaming_provider({"provider": "edge"}) is None
 
 
+def test_speech_alignment_is_opt_in_and_has_a_hard_off_override(monkeypatch):
+    assert ts.speech_alignment_enabled({"streaming": {}}) is False
+    assert ts.speech_alignment_enabled(
+        {"streaming": {"alignment": {"enabled": True}}}
+    ) is True
+
+    monkeypatch.setenv("HERMES_SPEECH_ALIGNMENT", "off")
+    assert ts.speech_alignment_enabled(
+        {"streaming": {"alignment": {"enabled": True}}}
+    ) is False
+
+    monkeypatch.setenv("HERMES_SPEECH_ALIGNMENT", "on")
+    assert ts.speech_alignment_enabled({"streaming": {}}) is True
+
+
+def test_openai_streamer_alignment_posts_pcm_without_affecting_streaming(monkeypatch):
+    captured = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, *_args):
+            return b'{"text":"Hermes moves.","words":[{"text":"Hermes","start_ms":0,"end_ms":220},{"text":"moves.","start_ms":220,"end_ms":510}]}'
+
+    def _urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        captured["body"] = request.data
+        return _Response()
+
+    monkeypatch.setattr(ts, "urlopen", _urlopen)
+    streamer = ts.OpenAIStreamer(
+        {
+            "streaming": {
+                "alignment": {
+                    "url": "http://qwen.example/v1/audio/align",
+                    "timeout_seconds": 1.5,
+                }
+            }
+        },
+        {"api_key": "unused", "base_url": "http://tts.example/v1"},
+    )
+
+    result = streamer.align("Hermes moves.", b"\x00\x00" * 2400)
+
+    assert result["text"] == "Hermes moves."
+    assert result["words"][1]["end_ms"] == 510
+    assert captured["url"] == "http://qwen.example/v1/audio/align"
+    assert captured["timeout"] == 1.5
+
+
+def test_openai_streamer_only_advertises_alignment_with_an_endpoint():
+    streamer = ts.OpenAIStreamer({"streaming": {}}, {"api_key": "unused"})
+
+    assert streamer.supports_alignment is False
+
+
 # ── Built-in provider availability ───────────────────────────────────────
 
 

@@ -56,6 +56,7 @@ class FakeVoiceAdapter:
         self.begin_count = 0
         self.finish_count = 0
         self.abort_count = 0
+        self.timeline: list[tuple[str, object]] = []
 
     def _should_auto_tts_for_chat(self, chat_id):
         return True
@@ -74,8 +75,13 @@ class FakeVoiceAdapter:
         if self._fail_after_write and len(self.written_chunks) >= 2:
             raise RuntimeError("adapter write failure after partial output")
         self.written_chunks.append(chunk)
+        self.timeline.append(("audio", chunk))
         if not handle.audible:
             handle.audible = True
+
+    async def send_speech_timing(self, handle, payload, metadata=None):
+        self.timeline.append(("timing", payload))
+        return True
 
     async def finish_streaming_tts(self, handle, *, interrupted=False):
         self.finish_count += 1
@@ -193,6 +199,9 @@ def _make_consumer(adapter, chat_id, loop, streamer):
     consumer._task = None
     consumer._lock = threading.Lock()
     consumer._strip_markdown = None
+    consumer._alignment_enabled = False
+    consumer._segment_index = 0
+    consumer._audio_offset_ms = 0
     return consumer
 
 
@@ -205,6 +214,112 @@ def _run_test(coro_factory, timeout=10.0):
         )
     finally:
         loop.close()
+
+
+async def _run_test_clause(consumer, clause):
+    consumer._handle = StreamingTTSHandle(
+        chat_id=consumer._chat_id,
+        audio_format=consumer._audio_format,
+    )
+    await consumer._synthesise_and_write(clause)
+
+
+class AligningStreamer(FakeStreamer):
+    """Fake provider that returns timings for the complete sentence PCM."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, chunks_per_clause=2, **kwargs)
+        self.aligned = []
+        self.supports_alignment = True
+
+    def stream(self, text: str):
+        self._clause_count += 1
+        pcm = b"\x00\x00" * 2400
+        yield pcm
+        yield pcm
+
+    def align(self, text: str, pcm: bytes):
+        self.aligned.append((text, pcm))
+        return {
+            "text": text,
+            "words": [
+                {"text": "Hermes", "start_ms": 0, "end_ms": 180},
+                {"text": "moves.", "start_ms": 180, "end_ms": 390},
+            ],
+        }
+
+
+@pytest.mark.asyncio
+async def test_enabled_alignment_does_not_buffer_when_provider_cannot_align(monkeypatch):
+    adapter = FakeVoiceAdapter()
+    streamer = FakeStreamer(chunks_per_clause=2)
+    streamer.supports_alignment = False
+
+    def should_not_be_called(text, pcm):
+        raise AssertionError("alignment called for a provider without support")
+
+    streamer.align = should_not_be_called
+    consumer = _make_consumer(adapter, "chat-1", asyncio.get_running_loop(), streamer)
+    consumer._alignment_enabled = True
+
+    await _run_test_clause(consumer, "Hermes moves.")
+
+    assert adapter.written_chunks == [b"chunk-1-0", b"chunk-1-1"]
+    assert not any(kind == "timing" for kind, _value in adapter.timeline)
+
+
+@pytest.mark.asyncio
+async def test_enabled_alignment_is_sent_before_buffered_pcm(monkeypatch):
+    adapter = FakeVoiceAdapter()
+    streamer = AligningStreamer()
+    consumer = _make_consumer(adapter, "chat-1", asyncio.get_running_loop(), streamer)
+    consumer._alignment_enabled = True
+    consumer._metadata = {"voice_session_turn_id": "turn-1"}
+
+    await _run_test_clause(consumer, "Hermes moves.")
+
+    assert streamer.aligned == [("Hermes moves.", b"\x00\x00" * 4800)]
+    assert [kind for kind, _value in adapter.timeline] == ["timing", "audio", "audio"]
+    payload = adapter.timeline[0][1]
+    assert payload["segment_id"] == "turn-1-tts-0"
+    assert payload["text"] == "Hermes moves."
+
+
+@pytest.mark.asyncio
+async def test_alignment_failure_still_delivers_the_buffered_pcm(monkeypatch):
+    adapter = FakeVoiceAdapter()
+    streamer = AligningStreamer()
+
+    def fail_align(text, pcm):
+        raise TimeoutError("aligner unavailable")
+
+    streamer.align = fail_align
+    consumer = _make_consumer(adapter, "chat-1", asyncio.get_running_loop(), streamer)
+    consumer._alignment_enabled = True
+
+    await _run_test_clause(consumer, "Hermes moves.")
+
+    assert adapter.written_chunks == [b"\x00\x00" * 2400] * 2
+    assert not any(kind == "timing" for kind, _value in adapter.timeline)
+
+
+@pytest.mark.asyncio
+async def test_aligned_sentences_offset_timing_by_prior_audio(monkeypatch):
+    adapter = FakeVoiceAdapter()
+    streamer = AligningStreamer()
+    consumer = _make_consumer(adapter, "chat-1", asyncio.get_running_loop(), streamer)
+    consumer._alignment_enabled = True
+    consumer._metadata = {"voice_session_turn_id": "turn-2"}
+
+    await _run_test_clause(consumer, "Hermes moves.")
+    await _run_test_clause(consumer, "Hermes moves.")
+
+    timing_payloads = [
+        value for kind, value in adapter.timeline if kind == "timing"
+    ]
+    assert timing_payloads[0]["words"][0]["start_ms"] == 0
+    assert timing_payloads[1]["words"][0]["start_ms"] == 200
+    assert timing_payloads[1]["words"][0]["end_ms"] == 380
 
 
 # ---------------------------------------------------------------------------

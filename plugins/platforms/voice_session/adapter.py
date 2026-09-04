@@ -775,6 +775,30 @@ class VoiceSessionAdapter(BasePlatformAdapter):
         if ok:
             handle.audible = True
 
+    async def send_speech_timing(
+        self,
+        handle: StreamingTTSHandle,
+        payload: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Send optional word timing before the matching buffered PCM."""
+        if not isinstance(handle, _VoiceSessionTTSHandle):
+            return False
+        if handle.aborted or handle.finished:
+            return False
+        connection = handle.connection
+        if connection is None or connection.closed or connection.active_tts is not handle:
+            return False
+        return await self._send_json(
+            connection,
+            {
+                "type": "speech_timing",
+                "turn_id": handle.turn_id,
+                "session_id": connection.session_id,
+                "payload": dict(payload),
+            },
+        )
+
     async def finish_streaming_tts(
         self,
         handle: StreamingTTSHandle,

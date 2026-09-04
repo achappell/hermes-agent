@@ -21,11 +21,15 @@ the dispatcher, config gate (`tts.<name>.streaming`), and resolver come free.
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
+import os
 import re
 import time
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterator, List, Optional
+from urllib.request import Request, urlopen
 
 from tools.tool_backend_helpers import resolve_openai_audio_api_key
 from tools.tts_tool import _get_provider, _load_tts_config, get_env_value
@@ -134,6 +138,7 @@ class StreamingTTSProvider(ABC):
     sample_rate: int = 24000
     channels: int = 1
     sample_width: int = 2  # bytes/sample (int16)
+    supports_alignment = False
 
     def __init__(self, tts_config: Dict, section: Dict):
         self.tts_config = tts_config
@@ -151,6 +156,15 @@ class StreamingTTSProvider(ABC):
     @abstractmethod
     def stream(self, text: str) -> Iterator[bytes]:
         """Yield PCM chunks for ``text``. Raise on failure (caller logs)."""
+
+    def align(self, text: str, pcm: bytes) -> Optional[Dict]:
+        """Return word timing for complete *pcm*, when the provider supports it.
+
+        Alignment is deliberately optional. Providers that cannot align their
+        own output keep the low-latency PCM path and let the client use its
+        audio-duration fallback.
+        """
+        return None
 
 
 _REGISTRY: Dict[str, type[StreamingTTSProvider]] = {}
@@ -187,6 +201,24 @@ def _try_instantiate(name: str, tts_config: Dict) -> Optional[StreamingTTSProvid
 # config knob); edge is absent because it has no chunked-PCM API — the
 # dispatcher's per-sentence sync path keeps it conversational instead.
 _PROVIDER_PRIORITY: List[str] = ["elevenlabs", "gemini", "openai", "xai"]
+
+
+def speech_alignment_enabled(tts_config: Dict) -> bool:
+    """Return whether the experimental forced-alignment path is enabled.
+
+    The environment variable is an emergency operator switch. An explicit
+    ``off`` always wins, so alignment can be killed without editing the voice
+    provider or restarting a deployment that reads the setting per turn.
+    """
+    override = os.environ.get("HERMES_SPEECH_ALIGNMENT", "").strip().lower()
+    if override:
+        return override in {"1", "true", "yes", "on"}
+
+    streaming_cfg = tts_config.get("streaming") or {}
+    alignment_cfg = streaming_cfg.get("alignment")
+    if isinstance(alignment_cfg, dict):
+        return alignment_cfg.get("enabled") is True
+    return alignment_cfg is True
 
 
 def resolve_streaming_provider(
@@ -282,6 +314,14 @@ class OpenAIStreamer(StreamingTTSProvider):
 
     sample_rate = 24000
 
+    @property
+    def supports_alignment(self) -> bool:
+        streaming_cfg = self.tts_config.get("streaming") or {}
+        alignment_cfg = streaming_cfg.get("alignment") or {}
+        return isinstance(alignment_cfg, dict) and bool(
+            str(alignment_cfg.get("url") or "").strip()
+        )
+
     @staticmethod
     def available() -> bool:
         return bool(_openai_config_api_key() or resolve_openai_audio_api_key())
@@ -306,6 +346,43 @@ class OpenAIStreamer(StreamingTTSProvider):
             response_format="pcm",
         ) as response:
             yield from _capped(response.iter_bytes(), "OpenAI streaming TTS")
+
+    def align(self, text: str, pcm: bytes) -> Optional[Dict]:
+        """Ask an optional provider-side aligner for timings after synthesis."""
+        streaming_cfg = self.tts_config.get("streaming") or {}
+        alignment_cfg = streaming_cfg.get("alignment") or {}
+        if not isinstance(alignment_cfg, dict):
+            return None
+        url = str(alignment_cfg.get("url") or "").strip()
+        if not url:
+            return None
+        try:
+            timeout = float(alignment_cfg.get("timeout_seconds", 4.0))
+        except (TypeError, ValueError):
+            timeout = 4.0
+        timeout = min(max(timeout, 0.5), 30.0)
+        body = json.dumps(
+            {
+                "input": text,
+                "audio_base64": base64.b64encode(pcm).decode("ascii"),
+                "sample_rate": self.sample_rate,
+                "channels": self.channels,
+                "sample_width": self.sample_width,
+                "language": alignment_cfg.get("language", "English"),
+            }
+        ).encode("utf-8")
+        request = Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=timeout) as response:
+            raw = response.read(1_000_001)
+        if len(raw) > 1_000_000:
+            raise ValueError("speech alignment response is too large")
+        payload = json.loads(raw)
+        return payload if isinstance(payload, dict) else None
 
 
 

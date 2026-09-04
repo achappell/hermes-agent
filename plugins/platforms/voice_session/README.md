@@ -48,13 +48,35 @@ or `{"type":"ping"}` for an application-level liveness check. Binary ingress
 is deliberately not part of v1; microphone capture and STT stay on the client.
 
 Server messages are JSON (`hello_ack`, `turn_accepted`, `text_delta`, `text`,
-`text_final`, `status`, `audio_start`, `audio_end`, `turn_end`, `error`, and
+`text_final`, `status`, `audio_start`, `speech_timing`, `audio_end`, `turn_end`, `error`, and
 interrupt events) interleaved with binary raw little-endian PCM frames. The
 `text_delta` payload is the accumulated draft preview and carries
 `replace: true`; clients should replace their preview (or append only the new
 suffix), not print the whole payload as a token delta. The `audio_start`
 message declares sample rate, channels, sample width, and an `exclusive`
 audio-focus hint; binary frames belong to that audio stream until `audio_end`.
+The optional `speech_timing` event is sent after `audio_start` and before the
+matching buffered PCM sentence:
+
+```json
+{
+  "type": "speech_timing",
+  "turn_id": "turn-1",
+  "session_id": "default",
+  "payload": {
+    "segment_id": "turn-1-tts-0",
+    "text": "Hermes keeps moving.",
+    "words": [
+      {"text": "Hermes", "start_ms": 0, "end_ms": 280},
+      {"text": "keeps", "start_ms": 280, "end_ms": 510},
+      {"text": "moving.", "start_ms": 510, "end_ms": 920}
+    ]
+  }
+}
+```
+
+The event is optional; clients must continue to render and play turns when it
+is absent. Clients must continue to render and play turns when it is absent.
 
 The stream is single-turn per device connection. Reconnects may reuse the same
 `session_id` so Hermes' normal session history remains stable. A reconnect may

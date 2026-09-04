@@ -143,6 +143,37 @@ async def test_streaming_pcm_lifecycle_is_ordered(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_speech_timing_is_sent_on_the_active_audio_stream(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+    adapter.handle_message = _noop_handle_message
+    await adapter._handle_turn(
+        connection, {"type": "turn", "text": "hello", "turn_id": "t-timing"}
+    )
+    handle = await adapter.begin_streaming_tts(connection.chat_id, AudioFormat())
+    assert handle is not None
+
+    assert await adapter.send_speech_timing(
+        handle,
+        {
+            "segment_id": "t-timing-tts-0",
+            "text": "Hermes moves.",
+            "words": [
+                {"text": "Hermes", "start_ms": 0, "end_ms": 180},
+                {"text": "moves.", "start_ms": 180, "end_ms": 390},
+            ],
+        },
+    ) is True
+
+    assert [frame["type"] for frame in websocket.json_frames] == [
+        "turn_accepted",
+        "audio_start",
+        "speech_timing",
+    ]
+    assert websocket.json_frames[-1]["payload"]["words"][1]["end_ms"] == 390
+
+
+@pytest.mark.asyncio
 async def test_late_pcm_after_abort_is_dropped(monkeypatch):
     adapter = _adapter(monkeypatch)
     connection, websocket = _connection(adapter)

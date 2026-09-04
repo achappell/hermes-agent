@@ -65,7 +65,11 @@ class StreamingTTSConsumer:
         metadata: Optional[Dict[str, Any]] = None,
         audio_format: Optional[AudioFormat] = None,
     ) -> None:
-        from tools.tts_streaming import SentenceChunker, resolve_streaming_provider
+        from tools.tts_streaming import (
+            SentenceChunker,
+            resolve_streaming_provider,
+            speech_alignment_enabled,
+        )
 
         self._adapter = adapter
         self._chat_id = chat_id
@@ -77,6 +81,7 @@ class StreamingTTSConsumer:
         # inactive and the gateway falls back to whole-file TTS.
         self._streamer = resolve_streaming_provider(tts_config)
         self._chunker = SentenceChunker()
+        self._alignment_enabled = speech_alignment_enabled(tts_config)
 
         if self._streamer is not None:
             self._audio_format = AudioFormat(
@@ -104,6 +109,8 @@ class StreamingTTSConsumer:
 
         # Pre-allocate the strip-markdown helper lazily to avoid import cycles.
         self._strip_markdown = None
+        self._segment_index = 0
+        self._audio_offset_ms = 0
 
     # ------------------------------------------------------------------
     # Public properties
@@ -326,16 +333,126 @@ class StreamingTTSConsumer:
         if self._streamer is None:
             return
 
+        align = getattr(self._streamer, "align", None)
+        if (
+            self._alignment_enabled
+            and getattr(self._streamer, "supports_alignment", False)
+            and callable(align)
+        ):
+            await self._synthesise_aligned_and_write(cleaned, align)
+            return
+
         async for chunk in self._iter_stream_chunks(cleaned):
-            if self._aborted or self._handle.aborted:
+            await self._write_audio_chunk(chunk)
+
+    async def _synthesise_aligned_and_write(self, text: str, align: Any) -> None:
+        """Buffer one sentence so timing can precede its PCM on the wire."""
+        chunks: list[bytes] = []
+        async for chunk in self._iter_stream_chunks(text):
+            if self._aborted or self._handle is None or self._handle.aborted:
                 return
-            if not chunk:
-                continue
-            was_audible = self._handle.audible
-            await self._adapter.write_streaming_tts(self._handle, chunk)
-            if not was_audible:
-                self._handle.audible = True
-                self._suppress_whole_file = True
+            if chunk:
+                chunks.append(bytes(chunk))
+        if not chunks or self._aborted or self._handle is None or self._handle.aborted:
+            return
+
+        pcm = b"".join(chunks)
+        timing = None
+        try:
+            timing = await asyncio.to_thread(align, text, pcm)
+        except Exception as exc:
+            # Alignment is an experiment. A slow or broken aligner must never
+            # turn a valid voice response into silence.
+            logger.info("speech alignment unavailable; using audio fallback: %s", exc)
+
+        payload = self._validated_timing_payload(timing, text, len(pcm))
+        sender = getattr(self._adapter, "send_speech_timing", None)
+        if payload is not None and callable(sender):
+            try:
+                sent = await sender(self._handle, payload, metadata=self._metadata)
+                if sent is False:
+                    logger.info("speech timing event was not accepted; using audio fallback")
+            except Exception as exc:
+                logger.info("speech timing event failed; using audio fallback: %s", exc)
+
+        for chunk in chunks:
+            await self._write_audio_chunk(chunk)
+        self._audio_offset_ms += self._pcm_duration_ms(len(pcm))
+        self._segment_index += 1
+
+    async def _write_audio_chunk(self, chunk: bytes) -> None:
+        if self._aborted or self._handle is None or self._handle.aborted or not chunk:
+            return
+        was_audible = self._handle.audible
+        await self._adapter.write_streaming_tts(self._handle, chunk)
+        if not was_audible:
+            self._handle.audible = True
+            self._suppress_whole_file = True
+
+    def _validated_timing_payload(
+        self,
+        timing: Any,
+        text: str,
+        pcm_length: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Make provider timing safe for the iOS wire contract."""
+        if not isinstance(timing, dict):
+            return None
+        raw_words = timing.get("words")
+        if not isinstance(raw_words, list) or not raw_words:
+            return None
+
+        duration_ms = self._pcm_duration_ms(pcm_length)
+        words: list[Dict[str, Any]] = []
+        previous_end = 0
+        expected_words = text.split()
+        if len(raw_words) != len(expected_words):
+            return None
+        for raw_word, expected in zip(raw_words, expected_words):
+            if not isinstance(raw_word, dict):
+                return None
+            word = str(raw_word.get("text") or "").strip()
+            try:
+                start_ms = float(raw_word["start_ms"])
+                end_ms = float(raw_word["end_ms"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            if (
+                not word
+                or word.strip(".,!?;:'\"()[]{}").casefold()
+                != expected.strip(".,!?;:'\"()[]{}").casefold()
+                or not start_ms.is_integer()
+                or not end_ms.is_integer()
+                or start_ms < previous_end
+                or end_ms <= start_ms
+                or end_ms > duration_ms + 250
+            ):
+                return None
+            words.append(
+                {
+                    "text": word,
+                    "start_ms": int(start_ms) + self._audio_offset_ms,
+                    "end_ms": int(end_ms) + self._audio_offset_ms,
+                }
+            )
+            previous_end = int(end_ms)
+
+        turn_id = str((self._metadata or {}).get("voice_session_turn_id") or "speech")
+        return {
+            "segment_id": f"{turn_id}-tts-{self._segment_index}",
+            "text": text,
+            "words": words,
+        }
+
+    def _pcm_duration_ms(self, pcm_length: int) -> int:
+        bytes_per_second = (
+            int(getattr(self._audio_format, "sample_rate", 0))
+            * int(getattr(self._audio_format, "channels", 0))
+            * int(getattr(self._audio_format, "sample_width", 0))
+        )
+        if pcm_length <= 0 or bytes_per_second <= 0:
+            return 0
+        return int(round(pcm_length * 1_000 / bytes_per_second))
 
     async def _iter_stream_chunks(self, text: str):
         """Yield provider PCM chunks one at a time without blocking the loop."""
