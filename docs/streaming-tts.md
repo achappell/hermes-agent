@@ -44,6 +44,10 @@ tts:
   provider: gemini
   streaming:
     provider: gemini      # or "auto"
+    alignment:
+      enabled: false      # experimental; false is the safe default
+      url: http://tts-host:8767/v1/audio/align
+      timeout_seconds: 4
   gemini:
     model: gemini-2.5-flash-preview-tts
     voice: Kore
@@ -63,6 +67,21 @@ All credential lookups go through `resolve_provider_secret()`
 (config > env/.env > credential pool) — never bare env reads. Streamed bodies
 are capped at 16 MiB per sentence, mirroring the sync providers' bounded
 upstream-body invariant.
+
+## Experimental speech alignment
+
+When `tts.streaming.alignment.enabled` is true, the gateway buffers one
+normalized sentence, asks the selected streaming provider for optional word
+timing, sends the `speech_timing` event before that sentence's PCM, and then
+plays the buffered audio. Providers without an aligner, unavailable aligner
+responses, malformed spans, timeouts, and adapter failures all fall back to
+ordinary PCM playback. The operator override `HERMES_SPEECH_ALIGNMENT=off`
+always disables the experiment; `on` enables it without changing the profile.
+
+The Caticorn Queen Qwen3 service exposes the compatible aligner only when it is
+started with `--forced-aligner-model`. The aligner must receive the exact text
+after Hermes TTS markdown stripping. Timings are validated for word order,
+positive spans, and audio bounds before they reach the client.
 
 ## Adding a new streaming provider
 
