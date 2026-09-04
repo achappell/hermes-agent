@@ -355,14 +355,9 @@ def _repair_ogg_container(file_str: str) -> str:
 
 
 # --- Long-form audio combination and delivery packing ---
-def _concat_audio_files(
-    audio_paths: List[str], output_path: str, *, voice_compatible: bool = False,
-    force_reencode: bool = False,
-) -> Optional[str]:
+def _concat_audio_files(audio_paths: List[str], output_path: str, *, voice_compatible: bool = False) -> Optional[str]:
     """Combine independently encoded chunks with ffmpeg (never byte-joined). OGG/Opus is always
-    re-encoded (even without voice opt-in); matching MP3 chunks keep their frames (``-c:a copy``)
-    unless ``force_reencode`` is requested (the tagged-TTS path mixes generated speech,
-    time-stretched speech, and silence, so per-chunk frames no longer line up).
+    re-encoded (even without voice opt-in); matching MP3 chunks keep their frames (``-c:a copy``).
     None when ffmpeg is missing/fails so callers keep the valid parts."""
     if not audio_paths:
         raise ValueError("No audio chunks to combine")
@@ -384,23 +379,8 @@ def _concat_audio_files(
         suffix = destination.suffix.lower()
         if voice_compatible or suffix in {".ogg", ".opus"}:
             args += ["-c:a", "libopus", "-ac", "1", "-b:a", "64k", "-vbr", "off"]
-        elif (
-            suffix == ".mp3" and not force_reencode
-            and all(Path(path).suffix.lower() == ".mp3" for path in audio_paths)
-        ):
-            # Matching MP3 provider chunks already share one output codec/config.
-            # Preserve those encoded frames instead of imposing a second lossy pass.
+        elif suffix == ".mp3" and all(Path(path).suffix.lower() == ".mp3" for path in audio_paths):
             args += ["-c:a", "copy"]
-        elif suffix == ".mp3":
-            args += ["-c:a", "libmp3lame", "-q:a", "2"]
-        elif suffix == ".m4a":
-            args += ["-c:a", "aac", "-b:a", "128k"]
-        elif suffix == ".wav":
-            args += ["-c:a", "pcm_s16le"]
-        elif suffix == ".flac":
-            args += ["-c:a", "flac"]
-        elif suffix == ".aac":
-            args += ["-c:a", "aac", "-b:a", "128k"]
         result = _ffmpeg_run(ffmpeg, [*args, str(temp_output)], timeout=120)
         if result.returncode == 0 and temp_output.exists() and temp_output.stat().st_size > 0:
             os.replace(temp_output, destination)
@@ -416,7 +396,6 @@ def _concat_audio_files(
 
 def _build_audio_delivery_files(
     audio_paths: List[str], output_path: str, profile: AudioDeliveryProfile, *, voice_compatible: bool = False,
-    force_reencode: bool = False,
 ) -> Tuple[List[str], bool]:
     """Pack final-encoded chunks under the hard upload limit -> ``(final_paths, combined_any)``.
 
@@ -441,8 +420,7 @@ def _build_audio_delivery_files(
             return list(group)
         combine_index += 1
         scratch = base.with_name(f".{base.stem}.delivery{combine_index:03d}.{uuid.uuid4().hex}{base.suffix}")
-        combined = _concat_audio_files(
-            group, str(scratch), voice_compatible=voice_compatible, force_reencode=force_reencode)
+        combined = _concat_audio_files(group, str(scratch), voice_compatible=voice_compatible)
         if not combined:
             return list(group)
         scratch_outputs.append(combined)

@@ -1,10 +1,6 @@
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
-from tools.tts_text_normalize import (
-    TtsAudioTagPart,
-    parse_audio_tags,
-    prepare_spoken_text,
-)
+from tools.tts_text_normalize import prepare_spoken_text
 
 
 class _DummyAdapter(BasePlatformAdapter):
@@ -51,40 +47,3 @@ def test_prepare_spoken_text_polish_edge_cases():
     assert "and/or" in prepare_spoken_text("choose and/or option")
     assert "N/A" in prepare_spoken_text("status N/A here")
     assert "2026/06/02" in prepare_spoken_text("due 2026/06/02 ok")
-
-
-def test_parse_audio_tags_preserves_order_and_pace_state():
-    parts, found = parse_audio_tags(
-        "Start [pace:0.8] slower [pause:300ms] again [pace:1.2] faster."
-    )
-
-    assert found is True
-    assert parts == [
-        TtsAudioTagPart(text="Start"),
-        TtsAudioTagPart(text="slower", pace=0.8),
-        TtsAudioTagPart(pause_seconds=0.3),
-        TtsAudioTagPart(text="again", pace=0.8),
-        TtsAudioTagPart(text="faster.", pace=1.2),
-    ]
-
-
-def test_parse_audio_tags_clamps_pace_and_pause():
-    parts, found = parse_audio_tags(
-        "[pace:0.1]slow [pause:25s] [pace:8]fast"
-    )
-
-    assert found is True
-    assert parts == [
-        TtsAudioTagPart(text="slow", pace=0.25),
-        TtsAudioTagPart(pause_seconds=10.0),
-        TtsAudioTagPart(text="fast", pace=4.0),
-    ]
-
-
-def test_parse_audio_tags_leaves_ambiguous_controls_literal():
-    raw = "Keep [pause:2] and [pace:0.8s] literal."
-
-    parts, found = parse_audio_tags(raw)
-
-    assert found is False
-    assert parts == [TtsAudioTagPart(text=raw)]
