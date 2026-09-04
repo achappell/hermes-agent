@@ -10,7 +10,7 @@ It does not call Qwen or `/v1/chat/completions` directly.
 
 ## Configuration
 
-Set these on the media server:
+Set these on the active Hermes profile:
 
 ```text
 VOICE_SESSION_TOKEN=<long-random-token>
@@ -76,7 +76,7 @@ matching buffered PCM sentence:
 ```
 
 The event is optional; clients must continue to render and play turns when it
-is absent. Clients must continue to render and play turns when it is absent.
+is absent.
 
 The stream is single-turn per device connection. Reconnects may reuse the same
 `session_id` so Hermes' normal session history remains stable. A reconnect may
