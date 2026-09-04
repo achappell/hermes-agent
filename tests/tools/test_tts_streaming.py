@@ -154,6 +154,47 @@ def test_openai_streamer_only_advertises_alignment_with_an_endpoint():
     assert streamer.supports_alignment is False
 
 
+def test_qwen_streamer_advertises_and_uses_configured_alignment(monkeypatch):
+    captured = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, *_args):
+            return b'{"text":"Hermes moves.","words":[]}'
+
+    def _urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        return _Response()
+
+    monkeypatch.setattr(ts, "urlopen", _urlopen)
+    config = {
+        "streaming": {
+            "alignment": {
+                "enabled": True,
+                "url": "http://qwen.example/v1/audio/align",
+                "timeout_seconds": 2.0,
+            }
+        }
+    }
+    streamer = ts.QwenStreamer(config, {"base_url": "http://qwen.example/v1"})
+
+    assert streamer.supports_alignment is True
+    assert streamer.align("Hermes moves.", b"\x00\x00") == {
+        "text": "Hermes moves.",
+        "words": [],
+    }
+    assert captured == {
+        "url": "http://qwen.example/v1/audio/align",
+        "timeout": 2.0,
+    }
+
+
 # ── Built-in provider availability ───────────────────────────────────────
 
 
