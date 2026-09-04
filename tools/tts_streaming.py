@@ -308,6 +308,60 @@ def _openai_config_api_key() -> str:
     return openai_cfg.get("api_key") or ""
 
 
+def _alignment_endpoint(tts_config: Dict) -> str:
+    streaming_cfg = tts_config.get("streaming") or {}
+    alignment_cfg = streaming_cfg.get("alignment") or {}
+    if not isinstance(alignment_cfg, dict):
+        return ""
+    return str(alignment_cfg.get("url") or "").strip()
+
+
+def _request_alignment(
+    tts_config: Dict,
+    text: str,
+    pcm: bytes,
+    *,
+    sample_rate: int,
+    channels: int,
+    sample_width: int,
+) -> Optional[Dict]:
+    """Ask the configured aligner for timings for one complete PCM sentence."""
+    streaming_cfg = tts_config.get("streaming") or {}
+    alignment_cfg = streaming_cfg.get("alignment") or {}
+    if not isinstance(alignment_cfg, dict):
+        return None
+    url = _alignment_endpoint(tts_config)
+    if not url:
+        return None
+    try:
+        timeout = float(alignment_cfg.get("timeout_seconds", 4.0))
+    except (TypeError, ValueError):
+        timeout = 4.0
+    timeout = min(max(timeout, 0.5), 30.0)
+    body = json.dumps(
+        {
+            "input": text,
+            "audio_base64": base64.b64encode(pcm).decode("ascii"),
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "sample_width": sample_width,
+            "language": alignment_cfg.get("language", "English"),
+        }
+    ).encode("utf-8")
+    request = Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=timeout) as response:
+        raw = response.read(1_000_001)
+    if len(raw) > 1_000_000:
+        raise ValueError("speech alignment response is too large")
+    payload = json.loads(raw)
+    return payload if isinstance(payload, dict) else None
+
+
 @register("openai")
 class OpenAIStreamer(StreamingTTSProvider):
     """OpenAI speech with ``response_format=pcm`` (24 kHz mono int16)."""
@@ -316,11 +370,7 @@ class OpenAIStreamer(StreamingTTSProvider):
 
     @property
     def supports_alignment(self) -> bool:
-        streaming_cfg = self.tts_config.get("streaming") or {}
-        alignment_cfg = streaming_cfg.get("alignment") or {}
-        return isinstance(alignment_cfg, dict) and bool(
-            str(alignment_cfg.get("url") or "").strip()
-        )
+        return bool(_alignment_endpoint(self.tts_config))
 
     @staticmethod
     def available() -> bool:
@@ -349,40 +399,14 @@ class OpenAIStreamer(StreamingTTSProvider):
 
     def align(self, text: str, pcm: bytes) -> Optional[Dict]:
         """Ask an optional provider-side aligner for timings after synthesis."""
-        streaming_cfg = self.tts_config.get("streaming") or {}
-        alignment_cfg = streaming_cfg.get("alignment") or {}
-        if not isinstance(alignment_cfg, dict):
-            return None
-        url = str(alignment_cfg.get("url") or "").strip()
-        if not url:
-            return None
-        try:
-            timeout = float(alignment_cfg.get("timeout_seconds", 4.0))
-        except (TypeError, ValueError):
-            timeout = 4.0
-        timeout = min(max(timeout, 0.5), 30.0)
-        body = json.dumps(
-            {
-                "input": text,
-                "audio_base64": base64.b64encode(pcm).decode("ascii"),
-                "sample_rate": self.sample_rate,
-                "channels": self.channels,
-                "sample_width": self.sample_width,
-                "language": alignment_cfg.get("language", "English"),
-            }
-        ).encode("utf-8")
-        request = Request(
-            url,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        return _request_alignment(
+            self.tts_config,
+            text,
+            pcm,
+            sample_rate=self.sample_rate,
+            channels=self.channels,
+            sample_width=self.sample_width,
         )
-        with urlopen(request, timeout=timeout) as response:
-            raw = response.read(1_000_001)
-        if len(raw) > 1_000_000:
-            raise ValueError("speech alignment response is too large")
-        payload = json.loads(raw)
-        return payload if isinstance(payload, dict) else None
 
 
 
@@ -397,6 +421,21 @@ class QwenStreamer(StreamingTTSProvider):
     """
 
     sample_rate = 24000
+
+    @property
+    def supports_alignment(self) -> bool:
+        return bool(_alignment_endpoint(self.tts_config))
+
+    def align(self, text: str, pcm: bytes) -> Optional[Dict]:
+        """Use the configured Caticorn Queen aligner for Qwen PCM."""
+        return _request_alignment(
+            self.tts_config,
+            text,
+            pcm,
+            sample_rate=self.sample_rate,
+            channels=self.channels,
+            sample_width=self.sample_width,
+        )
 
     @staticmethod
     def available() -> bool:
