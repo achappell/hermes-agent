@@ -72,11 +72,23 @@ upstream-body invariant.
 
 When `tts.streaming.alignment.enabled` is true, the gateway buffers one
 normalized sentence, asks the selected streaming provider for optional word
-timing, sends the `speech_timing` event before that sentence's PCM, and then
-plays the buffered audio. Providers without an aligner, unavailable aligner
-responses, malformed spans, timeouts, and adapter failures all fall back to
-ordinary PCM playback. The operator override `HERMES_SPEECH_ALIGNMENT=off`
-always disables the experiment; `on` enables it without changing the profile.
+timing, and sends one segment-scoped `speech_timing` record before that
+sentence's PCM. The record includes `segment_id`, normalized `text`, absolute
+`audio_offset_ms`, `duration_ms`, and either validated `words` with
+`timing_source: "alignment"` or `words: []` with
+`timing_source: "duration_fallback"` and a bounded `fallback_reason`.
+
+The alignment request is bounded by `timeout_seconds` (0.5–30 seconds, with a
+4-second default). Providers without an aligner, unavailable responses,
+422s, malformed spans, text mismatches, and timeouts publish a fallback record
+and still deliver the buffered PCM. When alignment is disabled or unsupported,
+the gateway keeps the low-latency streaming path and publishes the duration
+record after the segment's PCM has been written; it does not hold first audio
+for timing metadata. No partial word list or exception text is sent.
+
+The operator override `HERMES_SPEECH_ALIGNMENT=off` always disables the
+experiment; `on` enables it without changing the profile. Keep alignment
+disabled in local and media profiles during development.
 
 The Caticorn Queen Qwen3 service exposes the compatible aligner only when it is
 started with `--forced-aligner-model`. The aligner must receive the exact text

@@ -109,6 +109,20 @@ def test_speech_alignment_is_opt_in_and_has_a_hard_off_override(monkeypatch):
     assert ts.speech_alignment_enabled({"streaming": {}}) is True
 
 
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({"streaming": {}}, 4.0),
+        ({"streaming": {"alignment": {"timeout_seconds": 1.5}}}, 1.5),
+        ({"streaming": {"alignment": {"timeout_seconds": 0.1}}}, 0.5),
+        ({"streaming": {"alignment": {"timeout_seconds": 90}}}, 30.0),
+        ({"streaming": {"alignment": {"timeout_seconds": "bad"}}}, 4.0),
+    ],
+)
+def test_speech_alignment_timeout_is_bounded(config, expected):
+    assert ts.speech_alignment_timeout_seconds(config) == expected
+
+
 def test_openai_streamer_alignment_posts_pcm_without_affecting_streaming(monkeypatch):
     captured = {}
 

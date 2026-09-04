@@ -781,7 +781,7 @@ class VoiceSessionAdapter(BasePlatformAdapter):
         payload: Dict[str, Any],
         metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Send optional word timing before the matching buffered PCM."""
+        """Send one segment-scoped alignment or duration-fallback record."""
         if not isinstance(handle, _VoiceSessionTTSHandle):
             return False
         if handle.aborted or handle.finished:

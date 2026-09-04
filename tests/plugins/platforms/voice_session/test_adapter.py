@@ -162,6 +162,9 @@ async def test_speech_timing_is_sent_on_the_active_audio_stream(monkeypatch):
                 {"text": "Hermes", "start_ms": 0, "end_ms": 180},
                 {"text": "moves.", "start_ms": 180, "end_ms": 390},
             ],
+            "timing_source": "alignment",
+            "audio_offset_ms": 0,
+            "duration_ms": 500,
         },
     ) is True
 
@@ -171,6 +174,8 @@ async def test_speech_timing_is_sent_on_the_active_audio_stream(monkeypatch):
         "speech_timing",
     ]
     assert websocket.json_frames[-1]["payload"]["words"][1]["end_ms"] == 390
+    assert websocket.json_frames[-1]["payload"]["timing_source"] == "alignment"
+    assert websocket.json_frames[-1]["payload"]["duration_ms"] == 500
 
 
 @pytest.mark.asyncio

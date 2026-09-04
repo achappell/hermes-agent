@@ -55,8 +55,13 @@ interrupt events) interleaved with binary raw little-endian PCM frames. The
 suffix), not print the whole payload as a token delta. The `audio_start`
 message declares sample rate, channels, sample width, and an `exclusive`
 audio-focus hint; binary frames belong to that audio stream until `audio_end`.
-The optional `speech_timing` event is sent after `audio_start` and before the
-matching buffered PCM sentence:
+The optional `speech_timing` event describes one completed PCM segment. Every
+record has a stable `segment_id`, normalized spoken `text`, an absolute
+`audio_offset_ms` from the beginning of the inbound audio stream, and the
+segment's `duration_ms`. Word offsets use that same absolute stream clock.
+
+When alignment succeeds, the event is sent after `audio_start` and before the
+matching buffered PCM segment:
 
 ```json
 {
@@ -66,6 +71,9 @@ matching buffered PCM sentence:
   "payload": {
     "segment_id": "turn-1-tts-0",
     "text": "Hermes keeps moving.",
+    "timing_source": "alignment",
+    "audio_offset_ms": 0,
+    "duration_ms": 920,
     "words": [
       {"text": "Hermes", "start_ms": 0, "end_ms": 280},
       {"text": "keeps", "start_ms": 280, "end_ms": 510},
@@ -75,8 +83,37 @@ matching buffered PCM sentence:
 }
 ```
 
-The event is optional; clients must continue to render and play turns when it
-is absent.
+If alignment is disabled, unsupported, times out, returns an error, or
+returns malformed or text-mismatched metadata, the relay sends the same
+segment record with no word spans:
+
+```json
+{
+  "type": "speech_timing",
+  "turn_id": "turn-1",
+  "session_id": "default",
+  "payload": {
+    "segment_id": "turn-1-tts-1",
+    "text": "The next segment.",
+    "timing_source": "duration_fallback",
+    "fallback_reason": "timeout",
+    "audio_offset_ms": 920,
+    "duration_ms": 640,
+    "words": []
+  }
+}
+```
+
+An aligned record and an alignment-error fallback precede their buffered PCM.
+The disabled/unsupported low-latency path streams PCM immediately and sends
+its duration record after that segment completes. Valid `fallback_reason`
+values are `disabled`, `unsupported`, `missing`, `error`, `timeout`, and
+`invalid`; the relay never sends partial word timing or exception text.
+
+The event is optional for clients and may be absent when an adapter does not
+support timing events. Clients must continue to render and play turns when it
+is absent, and must use `duration_ms` for records whose `timing_source` is
+`duration_fallback`.
 
 The stream is single-turn per device connection. Reconnects may reuse the same
 `session_id` so Hermes' normal session history remains stable. A reconnect may
