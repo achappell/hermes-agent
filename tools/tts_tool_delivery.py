@@ -319,6 +319,45 @@ def _ffmpeg_transcode_to_opus(input_path: str, ogg_path: str) -> Optional[str]:
     return None
 
 
+def _convert_to_m4a(audio_path: str) -> Optional[str]:
+    """Convert any ffmpeg-readable audio to AAC .m4a for iMessage voice notes.
+
+    Photon / BlueBubbles render an MP3 "voice" as an empty bubble because
+    iMessage keys playability off the extension/MIME the sidecar infers;
+    .m4a / audio/mp4 plays. Returns the .m4a path or None on failure.
+    """
+    if shutil.which("ffmpeg") is None:
+        return None
+    m4a_path = audio_path.rsplit(".", 1)[0] + ".m4a"
+    # When the file is already *named* .m4a (the auto-TTS path builder hands
+    # Photon an .m4a path, but an MP3-only backend just wrote MP3 bytes into
+    # it), ffmpeg cannot read and write the same file. Stage through a temp.
+    in_place = os.path.abspath(m4a_path) == os.path.abspath(audio_path)
+    work_path = m4a_path + ".tmp.m4a" if in_place else m4a_path
+    try:
+        result = _ffmpeg_run(
+            "ffmpeg", ["-i", audio_path, "-c:a", "aac", "-b:a", "96k", "-ac", "1", "-f", "ipod",
+                       work_path, "-y"], timeout=30)
+        if result.returncode != 0:
+            logger.warning("ffmpeg m4a conversion failed with return code %d: %s",
+                           result.returncode, result.stderr.decode("utf-8", errors="ignore")[:200])
+            return None
+        if os.path.exists(work_path) and os.path.getsize(work_path) > 0:
+            if in_place:
+                os.replace(work_path, m4a_path)
+            return m4a_path
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg m4a conversion timed out after 30s")
+    except FileNotFoundError:
+        logger.warning("ffmpeg not found in PATH")
+    except Exception as e:
+        logger.warning("ffmpeg m4a conversion failed: %s", e, exc_info=True)
+    finally:
+        if in_place and os.path.exists(work_path):
+            _remove_quietly(work_path)
+    return None
+
+
 # --- Container sniffing / repair ---
 # Several backends ignore the requested opus format (Edge/xAI emit MP3, Piper WAV, some
 # OpenAI-compatible servers ignore response_format="opus"), which breaks native voice bubbles:

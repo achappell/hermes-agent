@@ -48,8 +48,8 @@ from tools.tts_command_provider import (
     _get_command_tts_output_format, _is_command_tts_voice_compatible, _resolve_command_provider_config)
 from tools.tool_backend_helpers import NOUS_MANAGED_PROVIDER
 from tools.tts_tool_delivery import (
-    _resolve_max_text_length, _build_audio_delivery_files, _convert_to_opus, _remove_quietly,
-    _repair_ogg_container, _resolve_audio_delivery_profile, _split_text_for_tts)
+    _resolve_max_text_length, _build_audio_delivery_files, _convert_to_m4a, _convert_to_opus, _remove_quietly,
+    _repair_ogg_container, _resolve_audio_delivery_profile, _sniff_audio_container, _split_text_for_tts)
 from tools.tts_tool_providers import (
     _config_bool, _generate_edge_tts, _generate_elevenlabs, _generate_gemini_tts, _generate_minimax_tts,
     _generate_mistral_tts, _generate_xai_tts, _resolve_minimax_tts_runtime)
@@ -157,6 +157,10 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
 
 # Platforms whose native voice-bubble delivery requires Ogg/Opus (MP3 renders broken there).
 OPUS_VOICE_PLATFORMS = frozenset({"telegram", "matrix", "feishu", "whatsapp", "signal"})
+# iMessage-family platforms (Photon, BlueBubbles) deliver voice notes as .m4a / audio/mp4 — an
+# .mp3 "voice" renders as an empty bubble. Kept separate from the Opus set: they get a real AAC
+# transcode, not Opus.
+M4A_VOICE_PLATFORMS = frozenset({"photon", "bluebubbles"})
 # Built-ins that emit Opus natively when asked for .ogg; the rest need ffmpeg for voice bubbles.
 _NATIVE_OPUS_PROVIDERS = frozenset({"openai", "elevenlabs", "mistral", "gemini"})
 _FFMPEG_OPUS_PROVIDERS = frozenset({"edge", "neutts", "minimax", "xai", "kittentts", "piper"})
@@ -237,12 +241,15 @@ def _synthesize_builtin(engine: str, text: str, file_str: str, tts_config: Dict[
 
 def _finalize_voice_delivery(
     file_str: str, provider: str, command_provider_config: Optional[Dict[str, Any]], want_opus: bool,
+    want_m4a: bool = False,
 ) -> tuple:
     """Voice-bubble eligibility (Opus-converting when needed) -> ``(path, voice_compatible)``.
 
     Command/plugin providers are documents unless they opt in via ``voice_compatible``; native-Opus
     built-ins qualify when the platform wants Opus and they wrote .ogg; MP3/WAV built-ins are
-    ffmpeg-converted only when the platform needs Opus."""
+    ffmpeg-converted only when the platform needs Opus. iMessage-family platforms (Photon,
+    BlueBubbles) get a real AAC/.m4a transcode instead — an .mp3 "voice" renders as an empty
+    bubble there."""
     if command_provider_config is not None:
         opted_in = _is_command_tts_voice_compatible(command_provider_config)
     elif provider not in BUILTIN_TTS_PROVIDERS:
@@ -250,6 +257,12 @@ def _finalize_voice_delivery(
     elif want_opus and provider in _FFMPEG_OPUS_PROVIDERS and not file_str.endswith(".ogg"):
         opus_path = _convert_to_opus(file_str)
         return (opus_path, True) if opus_path else (file_str, False)
+    elif want_m4a:
+        if _sniff_audio_container(file_str) != "m4a":
+            m4a_path = _convert_to_m4a(file_str)
+            if m4a_path:
+                file_str = m4a_path
+        return file_str, _sniff_audio_container(file_str) == "m4a"
     else:
         native = provider in _NATIVE_OPUS_PROVIDERS
         return file_str, native and want_opus and file_str.endswith(".ogg")
@@ -280,12 +293,14 @@ def _session_platform() -> tuple:
 
 def _resolve_output_base(
     output_path: Optional[str], provider: str, command_provider_config: Optional[Dict[str, Any]], want_opus: bool,
+    want_m4a: bool = False,
 ) -> tuple:
     """Pick the output file -> ``(Path, None)`` or ``(None, error_json)``.
 
     A caller path is rejected on ``..`` traversal (bug or prompt-injection; absolute is fine) and
     on protected credential/system locations. Default ``<audio cache>/tts_<timestamp>.<ext>``: the
-    command format, ``.ogg`` for native-Opus providers on Opus platforms, else ``.mp3``."""
+    command format, ``.ogg`` for native-Opus providers on Opus platforms, ``.m4a`` for iMessage-family
+    platforms (Photon, BlueBubbles), else ``.mp3``."""
     if output_path:
         from tools.path_security import has_traversal_component
         if has_traversal_component(output_path):
@@ -303,8 +318,12 @@ def _resolve_output_base(
     else:
         if command_provider_config is not None:
             ext = _get_command_tts_output_format(command_provider_config)
+        elif want_opus and provider in _NATIVE_OPUS_PROVIDERS:
+            ext = "ogg"
+        elif want_m4a:
+            ext = "m4a"
         else:
-            ext = "ogg" if want_opus and provider in _NATIVE_OPUS_PROVIDERS else "mp3"
+            ext = "mp3"
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         file_path = Path(_default_output_dir()) / f"tts_{timestamp}.{ext}"
     file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -327,6 +346,7 @@ def _tool_failure(prefix: str, provider: str, exc: BaseException) -> str:
 def _text_to_speech_single(
     text: str, file_str: str, *, provider: str, tts_config: Dict[str, Any],
     command_provider_config: Optional[Dict[str, Any]], want_opus: bool, instructions: Optional[str],
+    want_m4a: bool = False,
 ) -> str:
     """Synthesize one provider-safe chunk into *file_str*; returns the result envelope.
 
@@ -359,7 +379,7 @@ def _text_to_speech_single(
         # Sniff once for every provider: MP3/WAV bytes in a .ogg path render as 0-second bubbles.
         file_str = _repair_ogg_container(file_str)
         file_str, voice_compatible = _finalize_voice_delivery(
-            file_str, provider, command_provider_config, want_opus)
+            file_str, provider, command_provider_config, want_opus, want_m4a)
         logger.info("TTS audio saved: %s (%s bytes, provider: %s)", file_str, f"{os.path.getsize(file_str):,}", provider)
         return json.dumps({
             "success": True, "file_path": file_str, "media_tag": _media_tag([file_str], voice_compatible),
@@ -434,9 +454,10 @@ def text_to_speech_tool(
         logger.info("TTS text for provider %s split into %d chunks (input=%d chars, cap=%d)",
                     provider, len(chunks), len(text), max_len)
     platform, want_opus = _session_platform()
+    want_m4a = platform in M4A_VOICE_PLATFORMS
     delivery_profile = _resolve_audio_delivery_profile(platform, tts_config)
     base_path, error = _resolve_output_base(
-        output_path, provider, command_provider_config, want_opus)
+        output_path, provider, command_provider_config, want_opus, want_m4a)
     if error:
         return error
     generated_artifacts: set[str] = set()
@@ -444,7 +465,7 @@ def text_to_speech_tool(
     try:
         encoded_paths, chunk_results = _synthesize_chunks(
             chunks, base_path, generated_artifacts, provider=provider, tts_config=tts_config,
-            command_provider_config=command_provider_config, want_opus=want_opus,
+            command_provider_config=command_provider_config, want_opus=want_opus, want_m4a=want_m4a,
             instructions=instructions)
         voice_compatible = bool(chunk_results) and all(bool(r.get("voice_compatible")) for r in chunk_results)
         delivery_base = base_path.with_suffix(Path(encoded_paths[0]).suffix)
