@@ -810,6 +810,14 @@ OPUS_VOICE_PLATFORMS = frozenset({
     "signal",
 })
 
+# iMessage-family platforms (Photon, BlueBubbles) deliver voice notes as
+# .m4a / audio/mp4 — an .mp3 "voice" renders as an empty bubble. Keep them
+# separate from the Opus set; they get a real AAC transcode, not Opus.
+M4A_VOICE_PLATFORMS = frozenset({
+    "photon",
+    "bluebubbles",
+})
+
 
 def _get_provider_section(tts_config: Dict[str, Any], name: str) -> Dict[str, Any]:
     """Return a provider config block if it's a dict, else an empty dict."""
@@ -1462,6 +1470,55 @@ def _ffmpeg_transcode_to_opus(input_path: str, ogg_path: str) -> Optional[str]:
         logger.warning("ffmpeg not found in PATH")
     except Exception as e:
         logger.warning("ffmpeg OGG conversion failed: %s", e, exc_info=True)
+    finally:
+        if in_place and os.path.exists(work_path):
+            try:
+                os.remove(work_path)
+            except OSError:
+                pass
+    return None
+
+
+def _convert_to_m4a(audio_path: str) -> Optional[str]:
+    """Convert any ffmpeg-readable audio to AAC .m4a for iMessage voice notes.
+
+    Photon / BlueBubbles render an MP3 "voice" as an empty bubble because
+    iMessage keys playability off the extension/MIME the sidecar infers;
+    .m4a / audio/mp4 plays. Returns the .m4a path or None on failure.
+    """
+    if not _has_ffmpeg():
+        return None
+
+    m4a_path = audio_path.rsplit(".", 1)[0] + ".m4a"
+    # When the file is already *named* .m4a (the auto-TTS path builder hands
+    # Photon an .m4a path, but an MP3-only backend just wrote MP3 bytes into
+    # it), ffmpeg cannot read and write the same file. Stage through a temp.
+    in_place = os.path.abspath(m4a_path) == os.path.abspath(audio_path)
+    work_path = m4a_path + ".tmp.m4a" if in_place else m4a_path
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-i", audio_path, "-c:a", "aac", "-b:a", "96k",
+             "-ac", "1", "-f", "ipod", work_path, "-y"],
+            capture_output=True, timeout=30,
+            stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "ffmpeg m4a conversion failed with return code %d: %s",
+                result.returncode, result.stderr.decode("utf-8", errors="ignore")[:200]
+            )
+            return None
+        if os.path.exists(work_path) and os.path.getsize(work_path) > 0:
+            if in_place:
+                os.replace(work_path, m4a_path)
+            return m4a_path
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg m4a conversion timed out after 30s")
+    except FileNotFoundError:
+        logger.warning("ffmpeg not found in PATH")
+    except Exception as e:
+        logger.warning("ffmpeg m4a conversion failed: %s", e, exc_info=True)
     finally:
         if in_place and os.path.exists(work_path):
             try:
@@ -3202,6 +3259,7 @@ def _text_to_speech_single(
     from gateway.session_context import get_session_env
     platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
     want_opus = platform in OPUS_VOICE_PLATFORMS
+    want_m4a = platform in M4A_VOICE_PLATFORMS
 
     # Determine output path
     if output_path:
@@ -3457,6 +3515,15 @@ def _text_to_speech_single(
             if opus_path:
                 file_str = opus_path
                 voice_compatible = True
+        elif want_m4a:
+            # iMessage-family platforms (Photon, BlueBubbles): hand the sidecar
+            # a real .m4a so iMessage renders a playable voice note instead of
+            # an empty bubble (an .mp3 "voice" is unplayable there).
+            if _sniff_audio_container(file_str) != "m4a":
+                m4a_path = _convert_to_m4a(file_str)
+                if m4a_path:
+                    file_str = m4a_path
+            voice_compatible = _sniff_audio_container(file_str) == "m4a"
         elif provider in {"elevenlabs", "openai", "mistral", "gemini"}:
             voice_compatible = want_opus and file_str.endswith(".ogg")
 
@@ -3571,6 +3638,7 @@ def text_to_speech_tool(
     from gateway.session_context import get_session_env
     platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
     want_opus = platform in OPUS_VOICE_PLATFORMS
+    want_m4a = platform in M4A_VOICE_PLATFORMS
     delivery_profile = _resolve_audio_delivery_profile(platform, tts_config)
 
     # Determine output path (single-chunk short-circuit uses the final path).
@@ -3608,6 +3676,8 @@ def text_to_speech_tool(
             base_path = out_dir / f"tts_{timestamp}.{fmt}"
         elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini"}:
             base_path = out_dir / f"tts_{timestamp}.ogg"
+        elif want_m4a:
+            base_path = out_dir / f"tts_{timestamp}.m4a"
         else:
             base_path = out_dir / f"tts_{timestamp}.mp3"
     base_path.parent.mkdir(parents=True, exist_ok=True)
