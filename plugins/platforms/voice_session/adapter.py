@@ -124,6 +124,27 @@ def _safe_command(value: Any) -> str:
     return command.lower()
 
 
+def _get_session_db() -> Optional[Any]:
+    try:
+        from hermes_state import SessionDB
+
+        return SessionDB()
+    except Exception:
+        return None
+
+
+def _get_active_model() -> str:
+    try:
+        from agent.config import get_model
+
+        model = get_model()
+        if model:
+            return str(model)
+    except Exception:
+        pass
+    return os.getenv("HERMES_MODEL", "")
+
+
 def _bearer_token(headers: Any) -> str:
     raw = str(headers.get("Authorization", "") or "").strip()
     scheme, _, token = raw.partition(" ")
@@ -357,6 +378,23 @@ class VoiceSessionAdapter(BasePlatformAdapter):
                 await self._protocol_close(websocket, str(exc))
                 return websocket
 
+            db = _get_session_db()
+            history = []
+            title = ""
+            if db is not None:
+                try:
+                    raw_messages = db.get_messages_as_conversation(connection.session_id)
+                    for msg in raw_messages:
+                        role = str(msg.get("role") or "").lower()
+                        content = str(msg.get("content") or "").strip()
+                        if role in ("user", "assistant", "system") and content:
+                            history.append({"role": role, "content": content})
+                    sess_title = db.get_session_title(connection.session_id)
+                    if sess_title:
+                        title = str(sess_title)
+                except Exception:
+                    logger.debug("Could not load existing session history from db")
+
             await self._send_json(
                 connection,
                 {
@@ -366,13 +404,17 @@ class VoiceSessionAdapter(BasePlatformAdapter):
                     "device_id": connection.device_id,
                     "session_id": connection.session_id,
                     "chat_id": connection.chat_id,
+                    "model": _get_active_model(),
+                    "title": title,
                     "capabilities": [
                         "text_stream",
                         "pcm_s16le",
                         "interrupt",
                         "command_dispatch",
                         "structured_prompts",
+                        "session_management",
                     ],
+                    "history": history,
                     "resume": {
                         "requested_turn_id": connection.resume_turn_id,
                         "known": bool(
@@ -502,6 +544,15 @@ class VoiceSessionAdapter(BasePlatformAdapter):
             return
         if kind == "prompt_response":
             await self._handle_prompt_response(connection, payload)
+            return
+        if kind == "session_list":
+            await self._handle_session_list(connection, payload)
+            return
+        if kind == "session_new":
+            await self._handle_session_new(connection, payload)
+            return
+        if kind == "session_switch":
+            await self._handle_session_switch(connection, payload)
             return
         raise ValueError("unknown message type")
 
@@ -650,6 +701,121 @@ class VoiceSessionAdapter(BasePlatformAdapter):
             },
         )
         await self.handle_message(event)
+
+    async def _handle_session_list(
+        self, connection: _Connection, payload: Dict[str, Any]
+    ) -> None:
+        limit = payload.get("limit", 20)
+        try:
+            limit = max(1, min(int(limit), 100))
+        except (ValueError, TypeError):
+            limit = 20
+        offset = payload.get("offset", 0)
+        try:
+            offset = max(0, int(offset))
+        except (ValueError, TypeError):
+            offset = 0
+        search = str(payload.get("search") or "").strip()
+
+        db = _get_session_db()
+        sessions: list[Dict[str, Any]] = []
+        if db is not None:
+            try:
+                raw_sessions = db.list_sessions_rich(
+                    limit=limit,
+                    offset=offset,
+                    order_by_last_active=True,
+                    search_query=search or None,
+                )
+                for s in raw_sessions:
+                    sessions.append(
+                        {
+                            "id": str(s.get("id") or ""),
+                            "model": str(s.get("model") or "") or _get_active_model(),
+                            "title": str(s.get("title") or ""),
+                            "preview": str(s.get("preview") or ""),
+                            "message_count": int(s.get("message_count") or 0),
+                            "last_active": str(s.get("last_active") or s.get("started_at") or ""),
+                        }
+                    )
+            except Exception:
+                logger.exception("Failed to query session list from DB")
+
+        await self._send_json(
+            connection,
+            {
+                "type": "session_list_result",
+                "sessions": sessions,
+                "current_session_id": connection.session_id,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+
+    async def _handle_session_new(
+        self, connection: _Connection, payload: Dict[str, Any]
+    ) -> None:
+        raw_sid = payload.get("session_id")
+        if raw_sid:
+            new_session_id = _safe_id(raw_sid, "session_id")
+        else:
+            new_session_id = f"voice-{uuid.uuid4().hex[:8]}"
+
+        title = str(payload.get("title") or "").strip()
+        connection.session_id = new_session_id
+
+        db = _get_session_db()
+        if db is not None and title:
+            try:
+                db.set_session_title(new_session_id, title)
+            except Exception:
+                pass
+
+        await self._send_json(
+            connection,
+            {
+                "type": "session_switched",
+                "session_id": new_session_id,
+                "model": _get_active_model(),
+                "title": title,
+                "history": [],
+            },
+        )
+
+    async def _handle_session_switch(
+        self, connection: _Connection, payload: Dict[str, Any]
+    ) -> None:
+        session_id = _safe_id(payload.get("session_id"), "session_id")
+        connection.session_id = session_id
+
+        db = _get_session_db()
+        history: list[Dict[str, str]] = []
+        title = ""
+        model = _get_active_model()
+        if db is not None:
+            try:
+                raw_messages = db.get_messages_as_conversation(session_id)
+                for msg in raw_messages:
+                    role = str(msg.get("role") or "").lower()
+                    content = str(msg.get("content") or "").strip()
+                    if role in ("user", "assistant", "system") and content:
+                        history.append({"role": role, "content": content})
+                sess_title = db.get_session_title(session_id)
+                if sess_title:
+                    title = str(sess_title)
+            except Exception:
+                logger.debug("Could not load session history for switched session")
+
+        await self._send_json(
+            connection,
+            {
+                "type": "session_switched",
+                "session_id": session_id,
+                "model": model,
+                "title": title,
+                "history": history,
+            },
+        )
 
     async def send_exec_approval(
         self,
