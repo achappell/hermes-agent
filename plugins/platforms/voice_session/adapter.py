@@ -672,6 +672,41 @@ class VoiceSessionAdapter(BasePlatformAdapter):
             choice_values=choice_values,
         )
 
+    async def send_slash_confirm(
+        self,
+        chat_id: str,
+        title: str,
+        message: str,
+        session_key: str,
+        confirm_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a structured confirmation request to the voice client."""
+
+        connection = self._connection_for_chat(chat_id, metadata)
+        if connection is None:
+            return SendResult(
+                success=False,
+                error="voice-session device is not connected",
+                retryable=True,
+            )
+        prompt_id = _safe_id(confirm_id, "prompt_id")
+        options = [
+            {"id": "once", "label": "Approve Once", "style": "primary"},
+            {"id": "always", "label": "Always Approve"},
+            {"id": "cancel", "label": "Cancel", "style": "danger"},
+        ]
+        text = f"{title}\n\n{message}" if title else str(message or "")
+        return await self._send_prompt_request(
+            connection,
+            prompt_id=prompt_id,
+            prompt_kind="confirm",
+            session_key=session_key,
+            metadata=metadata,
+            text=text,
+            options=options,
+        )
+
     async def _send_prompt_request(
         self,
         connection: _Connection,
@@ -739,6 +774,31 @@ class VoiceSessionAdapter(BasePlatformAdapter):
         prompt_kind = str(payload.get("prompt_kind") or "").strip().lower()
         if prompt_kind and prompt_kind != prompt.prompt_kind:
             await self._send_prompt_rejected(connection, prompt_id, "kind_mismatch")
+            return
+
+        if prompt.prompt_kind == "confirm":
+            option_id = str(payload.get("option_id") or "").strip().lower()
+            if option_id not in prompt.option_ids:
+                await self._send_prompt_rejected(connection, prompt_id, "invalid_option")
+                return
+
+            from tools import slash_confirm
+
+            result_text = await slash_confirm.resolve(
+                prompt.session_key, prompt_id, option_id
+            )
+            self._pending_prompts.pop(prompt_id, None)
+            self._resolved_prompt_ids.add(prompt_id)
+            resolved_payload: Dict[str, Any] = {
+                "type": "prompt_resolved",
+                "prompt_id": prompt_id,
+                "prompt_kind": prompt.prompt_kind,
+                "status": "accepted",
+                "session_id": connection.session_id,
+            }
+            if result_text:
+                resolved_payload["text"] = str(result_text)
+            await self._send_json(connection, resolved_payload)
             return
 
         if prompt.prompt_kind == "clarify":
