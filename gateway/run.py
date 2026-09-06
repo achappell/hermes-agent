@@ -22800,7 +22800,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 not _streaming_tts_done
                 and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
             ):
-                await self._send_voice_reply(event, response)
+                if self._is_async_voice_reply():
+                    asyncio.create_task(self._send_voice_reply(event, response))
+                else:
+                    await self._send_voice_reply(event, response)
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -24055,6 +24058,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         await adapter.handle_message(event)
+
+    def _is_async_voice_reply(self) -> bool:
+        """Check if auto voice replies should deliver text first and generate audio in background."""
+        try:
+            from hermes_cli.config import load_config as _load_full_config
+            _full_cfg = _load_full_config()
+            voice_cfg = _full_cfg.get("voice") or {}
+            return bool(voice_cfg.get("async_tts", False))
+        except Exception:
+            return False
 
     def _should_send_voice_reply(
         self,
