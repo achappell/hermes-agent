@@ -95,6 +95,39 @@ _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 # 180s budget (is_reconnect=True preserves the offline update queue, #46621).
 _TELEGRAM_INITIAL_CONNECT_TIMEOUT_SECS_DEFAULT = 45.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+# A streamed voice turn can finish generating text before the last queued
+# sentence has finished synthesising. Ten seconds was enough for short probes,
+# but cut off longer replies at the exact point where the gateway finalised the
+# turn. Keep the drain bounded, while allowing a profile to tune it.
+_STREAMING_TTS_FINALIZATION_TIMEOUT_DEFAULT = 60.0
+_STREAMING_TTS_FINALIZATION_TIMEOUT_MAX = 600.0
+
+
+def _streaming_tts_finalization_timeout(
+    tts_config: Optional[Dict[str, Any]],
+) -> float:
+    """Resolve the bounded post-agent streaming-TTS drain timeout."""
+    streaming_config = (
+        tts_config.get("streaming")
+        if isinstance(tts_config, dict)
+        else None
+    )
+    raw_timeout = (
+        streaming_config.get("finalization_timeout")
+        if isinstance(streaming_config, dict)
+        else None
+    )
+    try:
+        timeout = (
+            float(raw_timeout)
+            if raw_timeout is not None
+            else _STREAMING_TTS_FINALIZATION_TIMEOUT_DEFAULT
+        )
+    except (TypeError, ValueError):
+        timeout = _STREAMING_TTS_FINALIZATION_TIMEOUT_DEFAULT
+    return max(1.0, min(timeout, _STREAMING_TTS_FINALIZATION_TIMEOUT_MAX))
+
+
 # End reasons that mean the USER deliberately closed this thread of work
 # (/new -> session_reset / new_session, an explicit exit, or a /switch).
 # Shared by _classify_completion_target (pre-flight verdict) and
@@ -6686,13 +6719,20 @@ class TurnRunner:
             # false positives from MagicMock auto-attribute creation in tests.
             if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
                 try:
+                    _approval_metadata = dict(ctx._status_thread_metadata or {})
+                    # Voice-session clients need the gateway approval request
+                    # id so a structured response can resolve the exact
+                    # waiting approval rather than relying on FIFO order.
+                    _approval_metadata["voice_session_prompt_id"] = str(
+                        approval_data.get("request_id") or ""
+                    )
                     _approval_fut = safe_schedule_threadsafe(
                         ctx._status_adapter.send_exec_approval(
                             chat_id=ctx._status_chat_id,
                             command=cmd,
                             session_key=_approval_session_key,
                             description=desc,
-                            metadata=ctx._status_thread_metadata,
+                            metadata=_approval_metadata,
                             allow_permanent=approval_data.get("allow_permanent", True),
                             allow_session=approval_data.get("allow_session", True),
                             smart_denied=approval_data.get("smart_denied", False),
@@ -10894,6 +10934,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True  # handled (silently dropped); do not fall through
 
         effective_mode = self._effective_busy_input_mode(event.source)
+        if (event.metadata or {}).get("voice_session_operation") == "steer":
+            # Explicit voice-session steering is already a typed operation;
+            # it must not inherit the surface's ordinary queue/interrupt
+            # policy or it would silently change meaning between clients.
+            effective_mode = "steer"
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
@@ -22755,7 +22800,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 not _streaming_tts_done
                 and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
             ):
-                await self._send_voice_reply(event, response)
+                if self._is_async_voice_reply():
+                    asyncio.create_task(self._send_voice_reply(event, response))
+                else:
+                    await self._send_voice_reply(event, response)
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -24010,6 +24058,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         await adapter.handle_message(event)
+
+    def _is_async_voice_reply(self) -> bool:
+        """Check if auto voice replies should deliver text first and generate audio in background."""
+        try:
+            from hermes_cli.config import load_config as _load_full_config
+            _full_cfg = _load_full_config()
+            voice_cfg = _full_cfg.get("voice") or {}
+            return bool(voice_cfg.get("async_tts", False))
+        except Exception:
+            return False
 
     def _should_send_voice_reply(
         self,
@@ -31364,7 +31422,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             #
             # finish() is called from the outer event-loop thread (not the
             # executor worker) so early returns from run_sync are also
-            # finalised.  wait_complete() drains queued audio; on timeout
+            # finalised.  wait_complete() drains queued audio; the bounded
+            # timeout is configurable at tts.streaming.finalization_timeout.
+            # On timeout
             # the consumer is aborted unconditionally — if audio was
             # audible, suppression is preserved so the gateway does not
             # replay from the beginning; if no audio was audible, the
@@ -31373,7 +31433,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _stts is not None:
                 _stts.finish()
                 try:
-                    await _stts.wait_complete(timeout=10.0)
+                    _stts_timeout = _streaming_tts_finalization_timeout(
+                        _load_tts_config()
+                    )
+                    await _stts.wait_complete(timeout=_stts_timeout)
                 except Exception as _stts_done_err:
                     logger.debug("streaming TTS wait_complete error: %s", _stts_done_err)
                 if not _stts.done:

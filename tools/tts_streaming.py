@@ -21,11 +21,16 @@ the dispatcher, config gate (`tts.<name>.streaming`), and resolver come free.
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
+import math
+import os
 import re
 import time
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterator, List, Optional
+from urllib.request import Request, urlopen
 
 from tools.tool_backend_helpers import resolve_openai_audio_api_key
 from tools.tts_tool import _get_provider, _load_tts_config, get_env_value
@@ -37,6 +42,9 @@ logger = logging.getLogger(__name__)
 # providers (``_read_tts_response_bytes`` in tools.tts_tool): a buggy or
 # hostile endpoint must not be able to feed us unbounded audio.
 _STREAM_SENTENCE_BYTE_CAP = 16 * 1024 * 1024
+_DEFAULT_SPEECH_ALIGNMENT_TIMEOUT_SECONDS = 4.0
+_MIN_SPEECH_ALIGNMENT_TIMEOUT_SECONDS = 0.5
+_MAX_SPEECH_ALIGNMENT_TIMEOUT_SECONDS = 30.0
 
 
 def _resolve_key(env_var: str, provider_id: str) -> str:
@@ -134,6 +142,7 @@ class StreamingTTSProvider(ABC):
     sample_rate: int = 24000
     channels: int = 1
     sample_width: int = 2  # bytes/sample (int16)
+    supports_alignment = False
 
     def __init__(self, tts_config: Dict, section: Dict):
         self.tts_config = tts_config
@@ -144,9 +153,22 @@ class StreamingTTSProvider(ABC):
     def available() -> bool:
         """True when this provider's credentials/SDK are usable right now."""
 
+    def is_ready(self) -> bool:
+        """Return whether this configured instance has a usable endpoint."""
+        return True
+
     @abstractmethod
     def stream(self, text: str) -> Iterator[bytes]:
         """Yield PCM chunks for ``text``. Raise on failure (caller logs)."""
+
+    def align(self, text: str, pcm: bytes) -> Optional[Dict]:
+        """Return word timing for complete *pcm*, when the provider supports it.
+
+        Alignment is deliberately optional. Providers that cannot align their
+        own output keep the low-latency PCM path and let the client use its
+        audio-duration fallback.
+        """
+        return None
 
 
 _REGISTRY: Dict[str, type[StreamingTTSProvider]] = {}
@@ -165,8 +187,14 @@ def _try_instantiate(name: str, tts_config: Dict) -> Optional[StreamingTTSProvid
     cls = _REGISTRY.get(name)
     if cls is None or not cls.available():
         return None
+    section = tts_config.get(name) or {}
+    if not isinstance(section, dict):
+        section = {}
     try:
-        return cls(tts_config, tts_config.get(name) or {})
+        instance = cls(tts_config, section)
+        if not instance.is_ready():
+            return None
+        return instance
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("streaming provider %s init failed: %s", name, exc)
         return None
@@ -177,6 +205,57 @@ def _try_instantiate(name: str, tts_config: Dict) -> Optional[StreamingTTSProvid
 # config knob); edge is absent because it has no chunked-PCM API — the
 # dispatcher's per-sentence sync path keeps it conversational instead.
 _PROVIDER_PRIORITY: List[str] = ["elevenlabs", "gemini", "openai", "xai"]
+
+
+def speech_alignment_enabled(tts_config: Dict) -> bool:
+    """Return whether the experimental forced-alignment path is enabled.
+
+    The environment variable is an emergency operator switch. An explicit
+    ``off`` always wins, so alignment can be killed without editing the voice
+    provider or restarting a deployment that reads the setting per turn.
+    """
+    override = os.environ.get("HERMES_SPEECH_ALIGNMENT", "").strip().lower()
+    if override:
+        return override in {"1", "true", "yes", "on"}
+
+    streaming_cfg = tts_config.get("streaming") or {}
+    alignment_cfg = streaming_cfg.get("alignment")
+    if isinstance(alignment_cfg, dict):
+        return alignment_cfg.get("enabled") is True
+    return alignment_cfg is True
+
+
+def speech_alignment_timeout_seconds(tts_config: Dict) -> float:
+    """Return the bounded timeout shared by alignment callers.
+
+    The relay must never keep a complete PCM sentence behind an unbounded
+    alignment request. Keep this resolver tolerant of incomplete profile
+    config because alignment is an optional enhancement, not a reason to
+    reject the voice profile.
+    """
+    timeout = _DEFAULT_SPEECH_ALIGNMENT_TIMEOUT_SECONDS
+    streaming_cfg = tts_config.get("streaming") or {}
+    alignment_cfg = (
+        streaming_cfg.get("alignment") or {}
+        if isinstance(streaming_cfg, dict)
+        else {}
+    )
+    if isinstance(alignment_cfg, dict):
+        try:
+            configured = float(
+                alignment_cfg.get(
+                    "timeout_seconds",
+                    _DEFAULT_SPEECH_ALIGNMENT_TIMEOUT_SECONDS,
+                )
+            )
+        except (TypeError, ValueError):
+            configured = timeout
+        if math.isfinite(configured):
+            timeout = configured
+    return min(
+        max(timeout, _MIN_SPEECH_ALIGNMENT_TIMEOUT_SECONDS),
+        _MAX_SPEECH_ALIGNMENT_TIMEOUT_SECONDS,
+    )
 
 
 def resolve_streaming_provider(
@@ -200,6 +279,11 @@ def resolve_streaming_provider(
     """
     streaming_cfg = tts_config.get("streaming") or {}
     pinned = str(streaming_cfg.get("provider") or "").lower().strip()
+    # Explicitly disabling streaming must not fall through to the configured
+    # provider. This lets a profile choose the complete Qwen route when its
+    # experimental chunked route has less consistent prosody.
+    if pinned in {"none", "off", "disabled", "false"}:
+        return None
     if pinned == "auto":
         for name in _PROVIDER_PRIORITY:
             inst = _try_instantiate(name, tts_config)
@@ -261,11 +345,69 @@ def _openai_config_api_key() -> str:
     return openai_cfg.get("api_key") or ""
 
 
+def _alignment_endpoint(tts_config: Dict) -> str:
+    streaming_cfg = tts_config.get("streaming") or {}
+    alignment_cfg = streaming_cfg.get("alignment") or {}
+    if not isinstance(alignment_cfg, dict):
+        return ""
+    return str(alignment_cfg.get("url") or "").strip()
+
+
+def _request_alignment(
+    tts_config: Dict,
+    text: str,
+    pcm: bytes,
+    *,
+    sample_rate: int,
+    channels: int,
+    sample_width: int,
+) -> Optional[Dict]:
+    """Ask the configured aligner for timings for one complete PCM sentence."""
+    streaming_cfg = tts_config.get("streaming") or {}
+    alignment_cfg = streaming_cfg.get("alignment") or {}
+    if not isinstance(alignment_cfg, dict):
+        return None
+    url = _alignment_endpoint(tts_config)
+    if not url:
+        return None
+    timeout = speech_alignment_timeout_seconds(tts_config)
+    # The Caticorn Queen aligner accepts the spoken words but rejects paragraph
+    # separators.  Keep those separators in the TTS input/audio; flatten only
+    # the alignment text so a formatted response cannot silently lose timing.
+    alignment_text = " ".join(str(text).split())
+    body = json.dumps(
+        {
+            "input": alignment_text,
+            "audio_base64": base64.b64encode(pcm).decode("ascii"),
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "sample_width": sample_width,
+            "language": alignment_cfg.get("language", "English"),
+        }
+    ).encode("utf-8")
+    request = Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=timeout) as response:
+        raw = response.read(1_000_001)
+    if len(raw) > 1_000_000:
+        raise ValueError("speech alignment response is too large")
+    payload = json.loads(raw)
+    return payload if isinstance(payload, dict) else None
+
+
 @register("openai")
 class OpenAIStreamer(StreamingTTSProvider):
     """OpenAI speech with ``response_format=pcm`` (24 kHz mono int16)."""
 
     sample_rate = 24000
+
+    @property
+    def supports_alignment(self) -> bool:
+        return bool(_alignment_endpoint(self.tts_config))
 
     @staticmethod
     def available() -> bool:
@@ -291,6 +433,138 @@ class OpenAIStreamer(StreamingTTSProvider):
             response_format="pcm",
         ) as response:
             yield from _capped(response.iter_bytes(), "OpenAI streaming TTS")
+
+    def align(self, text: str, pcm: bytes) -> Optional[Dict]:
+        """Ask an optional provider-side aligner for timings after synthesis."""
+        return _request_alignment(
+            self.tts_config,
+            text,
+            pcm,
+            sample_rate=self.sample_rate,
+            channels=self.channels,
+            sample_width=self.sample_width,
+        )
+
+
+
+@register("qwen")
+class QwenStreamer(StreamingTTSProvider):
+    """Qwen's custom chunked PCM route (normally the Queen's port 8767 service).
+
+    The complete OpenAI-shaped Qwen endpoint remains on the configured
+    openai.base_url (the usual 8765 route). This provider is deliberately
+    separate because the optimized service exposes
+    /audio/speech/stream and returns chunked raw PCM directly.
+    """
+
+    sample_rate = 24000
+
+    @property
+    def supports_alignment(self) -> bool:
+        return bool(_alignment_endpoint(self.tts_config))
+
+    def align(self, text: str, pcm: bytes) -> Optional[Dict]:
+        """Use the configured Caticorn Queen aligner for Qwen PCM."""
+        return _request_alignment(
+            self.tts_config,
+            text,
+            pcm,
+            sample_rate=self.sample_rate,
+            channels=self.channels,
+            sample_width=self.sample_width,
+        )
+
+    @staticmethod
+    def available() -> bool:
+        # This is a local service, so there is no cloud credential to require.
+        return True
+
+    def __init__(self, tts_config: Dict, section: Dict):
+        super().__init__(tts_config, section)
+        base_url = str(section.get("base_url") or "").strip().rstrip("/")
+        streaming_url = str(section.get("streaming_url") or "").strip().rstrip("/")
+        self._endpoint = streaming_url or (
+            f"{base_url}/audio/speech/stream" if base_url else ""
+        )
+
+    def is_ready(self) -> bool:
+        return bool(self._endpoint)
+
+    def stream(self, text: str) -> Iterator[bytes]:
+        yield from _capped(self._stream(text), "Qwen streaming TTS")
+
+    def _stream(self, text: str) -> Iterator[bytes]:
+        import requests
+
+        model = str(
+            self.section.get("model") or "qwen3-tts-streaming"
+        ).strip() or "qwen3-tts-streaming"
+        payload = {
+            "model": model,
+            "input": text,
+            "response_format": "pcm",
+        }
+        voice = str(self.section.get("voice") or "").strip()
+        if voice:
+            payload["voice"] = voice
+        language = str(self.section.get("language") or "").strip()
+        if language:
+            payload["language"] = language
+
+        # Keep the tuning surface available without baking experimental
+        # defaults into Hermes. The optimized Qwen service ignores fields it
+        # does not need and supplies its own safe defaults.
+        for key in (
+            "emit_every_frames",
+            "decode_window_frames",
+            "overlap_samples",
+            "max_frames",
+            "first_chunk_emit_every",
+            "first_chunk_decode_window",
+            "first_chunk_frames",
+            "repetition_penalty",
+            "repetition_penalty_window",
+        ):
+            value = self.section.get(key)
+            if value is not None:
+                payload[key] = value
+
+        headers = {
+            "Accept": "audio/pcm",
+            "Content-Type": "application/json",
+        }
+        api_key = str(self.section.get("api_key") or "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        try:
+            read_timeout = float(self.section.get("read_timeout", 120))
+        except (TypeError, ValueError):
+            read_timeout = 120.0
+        read_timeout = max(1.0, min(read_timeout, 600.0))
+
+        with requests.post(
+            self._endpoint,
+            headers=headers,
+            json=payload,
+            timeout=(10.0, read_timeout),
+            stream=True,
+        ) as response:
+            response.raise_for_status()
+            pending = b""
+            for chunk in response.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                data = pending + bytes(chunk)
+                aligned = len(data) - (len(data) % self.sample_width)
+                if aligned:
+                    yield data[:aligned]
+                pending = data[aligned:]
+            if pending:
+                logger.debug(
+                    "Qwen streaming TTS ended with %d unaligned PCM byte",
+                    len(pending),
+                )
 
 
 def _capped(chunks: Iterator[bytes], label: str) -> Iterator[bytes]:

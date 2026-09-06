@@ -155,3 +155,16 @@ def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
     assert result["final_response"] == "Hello from the agent."
 
 
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({"streaming": {"finalization_timeout": 90}}, 90.0),
+        ({"streaming": {"finalization_timeout": "not-a-number"}}, 60.0),
+        ({"streaming": {"finalization_timeout": 9999}}, 600.0),
+        ({}, 60.0),
+    ],
+)
+def test_streaming_tts_finalization_timeout_is_bounded(config, expected):
+    """Long streamed replies get room to drain without an unbounded wait."""
+    assert gateway_run._streaming_tts_finalization_timeout(config) == expected
+

@@ -44,6 +44,10 @@ tts:
   provider: gemini
   streaming:
     provider: gemini      # or "auto"
+    alignment:
+      enabled: false      # experimental; false is the safe default
+      url: http://tts-host:8767/v1/audio/align
+      timeout_seconds: 4
   gemini:
     model: gemini-2.5-flash-preview-tts
     voice: Kore
@@ -63,6 +67,33 @@ All credential lookups go through `resolve_provider_secret()`
 (config > env/.env > credential pool) — never bare env reads. Streamed bodies
 are capped at 16 MiB per sentence, mirroring the sync providers' bounded
 upstream-body invariant.
+
+## Experimental speech alignment
+
+When `tts.streaming.alignment.enabled` is true, the gateway buffers one
+normalized sentence, asks the selected streaming provider for optional word
+timing, and sends one segment-scoped `speech_timing` record before that
+sentence's PCM. The record includes `segment_id`, normalized `text`, absolute
+`audio_offset_ms`, `duration_ms`, and either validated `words` with
+`timing_source: "alignment"` or `words: []` with
+`timing_source: "duration_fallback"` and a bounded `fallback_reason`.
+
+The alignment request is bounded by `timeout_seconds` (0.5–30 seconds, with a
+4-second default). Providers without an aligner, unavailable responses,
+422s, malformed spans, text mismatches, and timeouts publish a fallback record
+and still deliver the buffered PCM. When alignment is disabled or unsupported,
+the gateway keeps the low-latency streaming path and publishes the duration
+record after the segment's PCM has been written; it does not hold first audio
+for timing metadata. No partial word list or exception text is sent.
+
+The operator override `HERMES_SPEECH_ALIGNMENT=off` always disables the
+experiment; `on` enables it without changing the profile. Keep alignment
+disabled in local and media profiles during development.
+
+The Caticorn Queen Qwen3 service exposes the compatible aligner only when it is
+started with `--forced-aligner-model`. The aligner must receive the exact text
+after Hermes TTS markdown stripping. Timings are validated for word order,
+positive spans, and audio bounds before they reach the client.
 
 ## Adding a new streaming provider
 
