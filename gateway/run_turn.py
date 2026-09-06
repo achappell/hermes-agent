@@ -1725,7 +1725,10 @@ class GatewayTurnMixin:
         if not _streaming_tts_done and self._should_send_voice_reply(
             event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):
-            await self._send_voice_reply(event, response)
+            if self._is_async_voice_reply():
+                asyncio.create_task(self._send_voice_reply(event, response))
+            else:
+                await self._send_voice_reply(event, response)
 
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.

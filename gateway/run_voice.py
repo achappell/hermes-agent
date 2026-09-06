@@ -277,6 +277,16 @@ class GatewayVoiceMixin:
             channel_prompt=channel_prompt)
         await adapter.handle_message(event)
 
+    def _is_async_voice_reply(self) -> bool:
+        """Check if auto voice replies should deliver text first and generate audio in background."""
+        try:
+            from hermes_cli.config import load_config as _load_full_config
+            _full_cfg = _load_full_config()
+            voice_cfg = _full_cfg.get("voice") or {}
+            return bool(voice_cfg.get("async_tts", False))
+        except Exception:
+            return False
+
     def _should_send_voice_reply(
         self, event: MessageEvent, response: str, agent_messages: list, already_sent: bool = False
     ) -> bool:
