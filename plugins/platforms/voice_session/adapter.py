@@ -489,6 +489,9 @@ class VoiceSessionAdapter(BasePlatformAdapter):
         if kind == "interrupt":
             await self._handle_interrupt(connection, payload)
             return
+        if kind == "steer":
+            await self._handle_steer(connection, payload)
+            return
         if kind == "command":
             await self._handle_command(connection, payload)
             return
@@ -496,6 +499,66 @@ class VoiceSessionAdapter(BasePlatformAdapter):
             await self._handle_prompt_response(connection, payload)
             return
         raise ValueError("unknown message type")
+
+    async def _handle_steer(
+        self, connection: _Connection, payload: Dict[str, Any]
+    ) -> None:
+        steer_id = _safe_id(
+            payload.get("steer_id") or uuid.uuid4().hex,
+            "steer_id",
+        )
+        turn_id = _safe_id(payload.get("turn_id"), "turn_id")
+        if (
+            turn_id != connection.current_turn_id
+            or connection.turn_end_sent
+        ):
+            await self._send_json(
+                connection,
+                {
+                    "type": "steer_rejected",
+                    "steer_id": steer_id,
+                    "turn_id": turn_id,
+                    "status": "stale_turn",
+                    "session_id": connection.session_id,
+                },
+            )
+            return
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            raise ValueError("steer text is empty")
+        if len(text) > MAX_TRANSCRIPT_CHARS:
+            raise ValueError("steer text is too long")
+
+        event = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            user_id=connection.client_id,
+            user_name=connection.display_name or connection.client_id,
+            source=self._source_for(connection, steer_id),
+            raw_message=payload,
+            message_id=steer_id,
+            metadata={
+                "voice_session_protocol": PROTOCOL_VERSION,
+                "voice_session_id": connection.session_id,
+                "voice_session_turn_id": turn_id,
+                "voice_session_steer_id": steer_id,
+                "voice_session_operation": "steer",
+                "voice_session_client_id": connection.client_id,
+                "voice_session_device_id": connection.device_id,
+            },
+            timestamp=datetime.now(timezone.utc),
+            allow_gateway_control=True,
+        )
+        await self.handle_message(event)
+        await self._send_json(
+            connection,
+            {
+                "type": "steer_accepted",
+                "steer_id": steer_id,
+                "turn_id": turn_id,
+                "session_id": connection.session_id,
+            },
+        )
 
     async def _handle_command(
         self, connection: _Connection, payload: Dict[str, Any]

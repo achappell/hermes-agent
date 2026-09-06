@@ -10934,6 +10934,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True  # handled (silently dropped); do not fall through
 
         effective_mode = self._effective_busy_input_mode(event.source)
+        if (event.metadata or {}).get("voice_session_operation") == "steer":
+            # Explicit voice-session steering is already a typed operation;
+            # it must not inherit the surface's ordinary queue/interrupt
+            # policy or it would silently change meaning between clients.
+            effective_mode = "steer"
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
