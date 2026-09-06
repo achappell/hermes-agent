@@ -417,6 +417,75 @@ async def test_clarify_response_resolves_choice_text_without_turn_dispatch(monke
 
 
 @pytest.mark.asyncio
+async def test_slash_confirm_emits_prompt_request(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+
+    result = await adapter.send_slash_confirm(
+        chat_id=connection.chat_id,
+        title="Confirm reload",
+        message="This clears the provider prompt cache.",
+        session_key="session-1",
+        confirm_id="confirm-1",
+        metadata={"voice_session_turn_id": "turn-1"},
+    )
+
+    assert result.success is True
+    prompt = websocket.json_frames[-1]
+    assert prompt["type"] == "prompt_request"
+    assert prompt["prompt_id"] == "confirm-1"
+    assert prompt["prompt_kind"] == "confirm"
+    assert prompt["turn_id"] == "turn-1"
+    assert "Confirm reload" in prompt["text"]
+    assert "provider prompt cache" in prompt["text"]
+    assert [option["id"] for option in prompt["options"]] == [
+        "once",
+        "always",
+        "cancel",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_slash_confirm_response_resolves_correlated_confirmation(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+    resolved = []
+
+    async def resolve(session_key, confirm_id, choice):
+        resolved.append((session_key, confirm_id, choice))
+        return "Reloaded."
+
+    monkeypatch.setattr("tools.slash_confirm.resolve", resolve)
+    await adapter.send_slash_confirm(
+        chat_id=connection.chat_id,
+        title="Confirm reload",
+        message="This clears the provider prompt cache.",
+        session_key="session-1",
+        confirm_id="confirm-response",
+    )
+
+    await adapter._handle_payload(
+        connection,
+        {
+            "type": "prompt_response",
+            "prompt_id": "confirm-response",
+            "prompt_kind": "confirm",
+            "option_id": "once",
+        },
+    )
+
+    assert resolved == [("session-1", "confirm-response", "once")]
+    assert websocket.json_frames[-1] == {
+        "type": "prompt_resolved",
+        "prompt_id": "confirm-response",
+        "prompt_kind": "confirm",
+        "status": "accepted",
+        "text": "Reloaded.",
+        "session_id": "default",
+    }
+
+
+@pytest.mark.asyncio
 async def test_text_draft_and_final_close_a_turn(monkeypatch):
     adapter = _adapter(monkeypatch)
     connection, websocket = _connection(adapter)
