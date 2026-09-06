@@ -486,6 +486,47 @@ async def test_slash_confirm_response_resolves_correlated_confirmation(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_steer_routes_text_for_the_active_turn_without_creating_a_new_turn(
+    monkeypatch,
+):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+    connection.current_turn_id = "turn-active"
+    connection.turn_end_sent = False
+    events = []
+
+    async def capture(event):
+        events.append(event)
+
+    adapter.handle_message = capture
+    await adapter._handle_payload(
+        connection,
+        {
+            "type": "steer",
+            "steer_id": "steer-1",
+            "turn_id": "turn-active",
+            "text": "Use the shorter answer.",
+        },
+    )
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.message_type is MessageType.TEXT
+    assert event.text == "Use the shorter answer."
+    assert event.metadata["voice_session_steer_id"] == "steer-1"
+    assert event.metadata["voice_session_turn_id"] == "turn-active"
+    assert event.metadata["voice_session_operation"] == "steer"
+    assert websocket.json_frames == [
+        {
+            "type": "steer_accepted",
+            "steer_id": "steer-1",
+            "turn_id": "turn-active",
+            "session_id": "default",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_text_draft_and_final_close_a_turn(monkeypatch):
     adapter = _adapter(monkeypatch)
     connection, websocket = _connection(adapter)
