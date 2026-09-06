@@ -959,3 +959,109 @@ async def test_reconnect_cursor_suppresses_duplicate_turn(monkeypatch):
     )
     assert second_ws.json_frames[-1]["type"] == "turn_duplicate"
     assert len(second_ws.json_frames) == 1
+
+
+@pytest.mark.asyncio
+async def test_session_list_returns_sessions_from_db(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+
+    class FakeSessionDB:
+        def list_sessions_rich(self, limit=20, offset=0, order_by_last_active=True, search_query=None):
+            return [
+                {
+                    "id": "voice-123",
+                    "model": "anthropic/claude-3-7-sonnet",
+                    "title": "Discussion about quantum computing",
+                    "preview": "Tell me about superposition",
+                    "message_count": 4,
+                    "last_active": "2026-09-06T12:00:00Z",
+                }
+            ]
+
+    monkeypatch.setattr("plugins.platforms.voice_session.adapter._get_session_db", lambda: FakeSessionDB())
+
+    await adapter._handle_payload(
+        connection,
+        {"type": "session_list", "limit": 10},
+    )
+
+    assert len(websocket.json_frames) == 1
+    frame = websocket.json_frames[0]
+    assert frame["type"] == "session_list_result"
+    assert frame["current_session_id"] == "default"
+    assert frame["limit"] == 10
+    assert len(frame["sessions"]) == 1
+    assert frame["sessions"][0]["id"] == "voice-123"
+    assert frame["sessions"][0]["title"] == "Discussion about quantum computing"
+
+
+@pytest.mark.asyncio
+async def test_session_new_creates_and_switches(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+
+    created_titles = {}
+
+    class FakeSessionDB:
+        def set_session_title(self, session_id, title):
+            created_titles[session_id] = title
+
+    monkeypatch.setattr("plugins.platforms.voice_session.adapter._get_session_db", lambda: FakeSessionDB())
+    monkeypatch.setattr("plugins.platforms.voice_session.adapter._get_active_model", lambda: "anthropic/claude-3-7-sonnet")
+
+    await adapter._handle_payload(
+        connection,
+        {"type": "session_new", "session_id": "new-session-42", "title": "Fresh Topic"},
+    )
+
+    assert connection.session_id == "new-session-42"
+    assert created_titles.get("new-session-42") == "Fresh Topic"
+    assert len(websocket.json_frames) == 1
+    frame = websocket.json_frames[0]
+    assert frame["type"] == "session_switched"
+    assert frame["session_id"] == "new-session-42"
+    assert frame["title"] == "Fresh Topic"
+    assert frame["model"] == "anthropic/claude-3-7-sonnet"
+    assert frame["history"] == []
+
+
+@pytest.mark.asyncio
+async def test_session_switch_hydrates_history(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+
+    class FakeSessionDB:
+        def get_messages_as_conversation(self, session_id):
+            if session_id == "sess-99":
+                return [
+                    {"role": "user", "content": "What is the capital of France?"},
+                    {"role": "assistant", "content": "Paris."},
+                ]
+            return []
+
+        def get_session_title(self, session_id):
+            if session_id == "sess-99":
+                return "Geography Quiz"
+            return None
+
+    monkeypatch.setattr("plugins.platforms.voice_session.adapter._get_session_db", lambda: FakeSessionDB())
+    monkeypatch.setattr("plugins.platforms.voice_session.adapter._get_active_model", lambda: "custom-model")
+
+    await adapter._handle_payload(
+        connection,
+        {"type": "session_switch", "session_id": "sess-99"},
+    )
+
+    assert connection.session_id == "sess-99"
+    assert len(websocket.json_frames) == 1
+    frame = websocket.json_frames[0]
+    assert frame["type"] == "session_switched"
+    assert frame["session_id"] == "sess-99"
+    assert frame["title"] == "Geography Quiz"
+    assert frame["model"] == "custom-model"
+    assert frame["history"] == [
+        {"role": "user", "content": "What is the capital of France?"},
+        {"role": "assistant", "content": "Paris."},
+    ]
+
