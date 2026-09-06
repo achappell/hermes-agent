@@ -10,6 +10,7 @@ channel, not a second Chat Completions client.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextvars
 import hmac
 import json
@@ -177,6 +178,9 @@ class _VoiceSessionPrompt:
     turn_id: str = ""
     option_ids: Set[str] = field(default_factory=set)
     choice_values: Dict[str, str] = field(default_factory=dict)
+    response_future: Optional[concurrent.futures.Future[str]] = field(
+        default=None, repr=False
+    )
 
 
 _VOICE_SESSION_COMMAND_CONTEXT: contextvars.ContextVar[
@@ -367,6 +371,7 @@ class VoiceSessionAdapter(BasePlatformAdapter):
                         "pcm_s16le",
                         "interrupt",
                         "command_dispatch",
+                        "structured_prompts",
                     ],
                     "resume": {
                         "requested_turn_id": connection.resume_turn_id,
@@ -770,6 +775,197 @@ class VoiceSessionAdapter(BasePlatformAdapter):
             options=options,
         )
 
+    async def send_sudo_password(
+        self,
+        chat_id: str,
+        prompt: str,
+        session_key: str,
+        prompt_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Ask the voice client for a masked sudo password.
+
+        The response is held in a private waiter and is never included in the
+        acknowledgement frame.  Callers that need the value use the prompt's
+        internal future through the callback bridge installed for the turn.
+        """
+
+        connection = self._connection_for_chat(chat_id, metadata)
+        if connection is None:
+            return SendResult(
+                success=False,
+                error="voice-session device is not connected",
+                retryable=True,
+            )
+        return await self._send_sensitive_prompt(
+            connection,
+            prompt_id=_safe_id(prompt_id, "prompt_id"),
+            prompt_kind="sudo",
+            session_key=session_key,
+            metadata=metadata,
+            text=prompt,
+        )
+
+    async def send_secret(
+        self,
+        chat_id: str,
+        prompt: str,
+        session_key: str,
+        prompt_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Ask the voice client for a masked secret value."""
+
+        connection = self._connection_for_chat(chat_id, metadata)
+        if connection is None:
+            return SendResult(
+                success=False,
+                error="voice-session device is not connected",
+                retryable=True,
+            )
+        return await self._send_sensitive_prompt(
+            connection,
+            prompt_id=_safe_id(prompt_id, "prompt_id"),
+            prompt_kind="secret",
+            session_key=session_key,
+            metadata=metadata,
+            text=prompt,
+        )
+
+    async def _send_sensitive_prompt(
+        self,
+        connection: _Connection,
+        *,
+        prompt_id: str,
+        prompt_kind: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]],
+        text: str,
+        response_future: Optional[concurrent.futures.Future[str]] = None,
+    ) -> SendResult:
+        return await self._send_prompt_request(
+            connection,
+            prompt_id=prompt_id,
+            prompt_kind=prompt_kind,
+            session_key=session_key,
+            metadata=metadata,
+            text=str(text or ""),
+            options=[],
+            sensitive=True,
+            response_future=response_future or concurrent.futures.Future(),
+        )
+
+    async def _request_sensitive_value(
+        self,
+        kind: str,
+        prompt: str,
+        prompt_id: str,
+        metadata: Dict[str, Any],
+    ) -> str:
+        connection = self._connection_for_chat(
+            str(metadata.get("_voice_session_chat_id") or ""), metadata
+        )
+        if connection is None:
+            return ""
+
+        response_future: concurrent.futures.Future[str] = concurrent.futures.Future()
+        result = await self._send_sensitive_prompt(
+            connection,
+            prompt_id=_safe_id(prompt_id, "prompt_id"),
+            prompt_kind=kind,
+            session_key=str(metadata.get("_voice_session_key") or ""),
+            metadata=metadata,
+            text=prompt,
+            response_future=response_future,
+        )
+        if not result.success:
+            return ""
+        try:
+            return await asyncio.wait_for(
+                asyncio.wrap_future(response_future),
+                timeout=DEFAULT_PROMPT_TIMEOUT_SECONDS,
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pending = self._pending_prompts.pop(prompt_id, None)
+            if pending is not None and not response_future.done():
+                response_future.set_result("")
+            return ""
+
+    def _run_sensitive_prompt(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        kind: str,
+        prompt: str,
+        metadata: Dict[str, Any],
+    ) -> str:
+        prompt_id = f"{kind}-{uuid.uuid4().hex}"
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._request_sensitive_value(kind, prompt, prompt_id, metadata),
+                loop,
+            )
+            return str(
+                future.result(timeout=DEFAULT_PROMPT_TIMEOUT_SECONDS + 5) or ""
+            )
+        except Exception:
+            return ""
+
+    def _install_prompt_bridges(
+        self, connection: _Connection
+    ) -> tuple[Any, Any]:
+        from tools.skills_tool import set_secret_capture_context_callback
+        from tools.terminal_tool import set_sudo_password_context_callback
+
+        loop = asyncio.get_running_loop()
+        base_metadata = {
+            "_voice_session_chat_id": connection.chat_id,
+            "_voice_session_key": "",
+            "voice_session_id": connection.session_id,
+            "voice_session_turn_id": connection.current_turn_id or "",
+        }
+
+        def sudo_password_callback() -> str:
+            return self._run_sensitive_prompt(
+                loop,
+                "sudo",
+                "Enter the sudo password.",
+                dict(base_metadata),
+            )
+
+        def secret_capture_callback(
+            var_name: str, prompt: str, metadata: Optional[Dict[str, Any]] = None
+        ) -> Dict[str, Any]:
+            request_metadata = dict(base_metadata)
+            request_metadata.update(metadata or {})
+            value = self._run_sensitive_prompt(
+                loop,
+                "secret",
+                str(prompt or f"Enter {var_name}."),
+                request_metadata,
+            )
+            return {
+                "success": bool(value),
+                "stored_as": var_name,
+                "validated": bool(value),
+                "skipped": not bool(value),
+            }
+
+        return (
+            set_sudo_password_context_callback(sudo_password_callback),
+            set_secret_capture_context_callback(secret_capture_callback),
+        )
+
+    @staticmethod
+    def _reset_prompt_bridges(tokens: Optional[tuple[Any, Any]]) -> None:
+        if tokens is None:
+            return
+        from tools.skills_tool import reset_secret_capture_context_callback
+        from tools.terminal_tool import reset_sudo_password_context_callback
+
+        sudo_token, secret_token = tokens
+        reset_secret_capture_context_callback(secret_token)
+        reset_sudo_password_context_callback(sudo_token)
+
     async def _send_prompt_request(
         self,
         connection: _Connection,
@@ -783,6 +979,7 @@ class VoiceSessionAdapter(BasePlatformAdapter):
         sensitive: bool = False,
         timeout_s: int = DEFAULT_PROMPT_TIMEOUT_SECONDS,
         choice_values: Optional[Dict[str, str]] = None,
+        response_future: Optional[concurrent.futures.Future[str]] = None,
     ) -> SendResult:
         """Register and send one typed prompt without creating a turn."""
 
@@ -799,6 +996,7 @@ class VoiceSessionAdapter(BasePlatformAdapter):
             turn_id=turn_id,
             option_ids={str(option["id"]) for option in options if option.get("id")},
             choice_values=dict(choice_values or {}),
+            response_future=response_future,
         )
         self._pending_prompts[prompt_id] = prompt
         payload: Dict[str, Any] = {
@@ -837,6 +1035,32 @@ class VoiceSessionAdapter(BasePlatformAdapter):
         prompt_kind = str(payload.get("prompt_kind") or "").strip().lower()
         if prompt_kind and prompt_kind != prompt.prompt_kind:
             await self._send_prompt_rejected(connection, prompt_id, "kind_mismatch")
+            return
+
+        if prompt.prompt_kind in {"sudo", "secret"}:
+            value = payload.get("value")
+            if not isinstance(value, str):
+                await self._send_prompt_rejected(connection, prompt_id, "value_required")
+                return
+            if len(value) > MAX_TRANSCRIPT_CHARS:
+                await self._send_prompt_rejected(connection, prompt_id, "value_too_long")
+                return
+
+            self._pending_prompts.pop(prompt_id, None)
+            self._resolved_prompt_ids.add(prompt_id)
+            response_future = prompt.response_future
+            if response_future is not None and not response_future.done():
+                response_future.set_result(value)
+            await self._send_json(
+                connection,
+                {
+                    "type": "prompt_resolved",
+                    "prompt_id": prompt_id,
+                    "prompt_kind": prompt.prompt_kind,
+                    "status": "accepted" if value else "cancelled",
+                    "session_id": connection.session_id,
+                },
+            )
             return
 
         if prompt.prompt_kind == "confirm":
@@ -960,6 +1184,20 @@ class VoiceSessionAdapter(BasePlatformAdapter):
         )
 
     async def handle_message(self, event: MessageEvent) -> None:
+        connection = self._connections.get(event.source.chat_id)
+        bridge_tokens = (
+            self._install_prompt_bridges(connection)
+            if connection is not None
+            else None
+        )
+        try:
+            await self._handle_message_with_prompt_bridges(event)
+        finally:
+            self._reset_prompt_bridges(bridge_tokens)
+
+    async def _handle_message_with_prompt_bridges(
+        self, event: MessageEvent
+    ) -> None:
         command_id = str(
             (event.metadata or {}).get("voice_session_command_id") or ""
         ).strip()
@@ -1616,6 +1854,12 @@ class VoiceSessionAdapter(BasePlatformAdapter):
                 self._connections.pop(connection.chat_id, None)
             return
         connection.closed = True
+        for prompt_id, prompt in list(self._pending_prompts.items()):
+            if prompt.connection is not connection or prompt.response_future is None:
+                continue
+            self._pending_prompts.pop(prompt_id, None)
+            if not prompt.response_future.done():
+                prompt.response_future.set_result("")
         if connection.active_tts is not None:
             connection.active_tts.aborted = True
             connection.active_tts = None

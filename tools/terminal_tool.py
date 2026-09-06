@@ -34,6 +34,7 @@ Usage:
 """
 
 import importlib.util
+import contextvars
 import json
 import logging
 import os
@@ -47,7 +48,7 @@ import atexit
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, Callable, List
 
 from utils import env_var_enabled
 
@@ -266,10 +267,19 @@ _sudo_password_cache_lock = threading.Lock()
 # the per-session queue in tools.approval, not through these callbacks,
 # so it's unaffected.
 _callback_tls = threading.local()
+_sudo_password_context_callback: contextvars.ContextVar[
+    Optional[Callable[[], str]]
+] = contextvars.ContextVar(
+    "sudo_password_context_callback", default=None
+)
 
 
 def _get_sudo_password_callback():
-    return getattr(_callback_tls, "sudo_password", None)
+    context_callback = _sudo_password_context_callback.get()
+    if context_callback is not None:
+        return context_callback
+    callback = getattr(_callback_tls, "sudo_password", None)
+    return callback
 
 
 def _current_session_key() -> str:
@@ -296,6 +306,18 @@ def set_sudo_password_callback(cb):
     ThreadPoolExecutor each have their own callback slot.
     """
     _callback_tls.sudo_password = cb
+
+
+def set_sudo_password_context_callback(cb):
+    """Install a context-scoped sudo callback for one gateway turn."""
+
+    return _sudo_password_context_callback.set(cb)
+
+
+def reset_sudo_password_context_callback(token) -> None:
+    """Restore the previous context-scoped sudo callback."""
+
+    _sudo_password_context_callback.reset(token)
 
 
 def set_approval_callback(cb):
