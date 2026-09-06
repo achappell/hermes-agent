@@ -247,6 +247,176 @@ async def test_gateway_command_without_text_still_completes(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_exec_approval_emits_correlated_prompt_request(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+
+    result = await adapter.send_exec_approval(
+        chat_id=connection.chat_id,
+        command="rm -rf /tmp/example",
+        session_key="session-1",
+        description="deletes temporary files",
+        metadata={"voice_session_turn_id": "turn-1"},
+    )
+
+    assert result.success is True
+    prompt = websocket.json_frames[-1]
+    assert prompt["type"] == "prompt_request"
+    assert prompt["prompt_id"] == result.message_id
+    assert prompt["prompt_kind"] == "approval"
+    assert prompt["turn_id"] == "turn-1"
+    assert prompt["session_id"] == "default"
+    assert "rm -rf /tmp/example" in prompt["text"]
+    assert [option["id"] for option in prompt["options"]] == [
+        "once",
+        "session",
+        "always",
+        "deny",
+    ]
+    assert prompt["sensitive"] is False
+
+
+@pytest.mark.asyncio
+async def test_prompt_response_resolves_approval_without_turn_dispatch(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+    resolved = []
+
+    async def no_turn(_event):
+        raise AssertionError("prompt responses must not become turns")
+
+    adapter.handle_message = no_turn
+    monkeypatch.setattr(
+        "tools.approval.resolve_gateway_approval",
+        lambda session_key, choice, **kwargs: resolved.append(
+            (session_key, choice, kwargs)
+        ) or 1,
+    )
+    prompt_result = await adapter.send_exec_approval(
+        chat_id=connection.chat_id,
+        command="rm -rf /tmp/example",
+        session_key="session-1",
+        metadata={"voice_session_prompt_id": "approval-1"},
+    )
+
+    await adapter._handle_payload(
+        connection,
+        {
+            "type": "prompt_response",
+            "prompt_id": prompt_result.message_id,
+            "prompt_kind": "approval",
+            "option_id": "once",
+        },
+    )
+
+    assert resolved == [("session-1", "once", {"request_id": "approval-1"})]
+    assert websocket.json_frames[-1] == {
+        "type": "prompt_resolved",
+        "prompt_id": "approval-1",
+        "prompt_kind": "approval",
+        "status": "accepted",
+        "session_id": "default",
+    }
+
+
+@pytest.mark.asyncio
+async def test_invalid_prompt_response_is_rejected_without_consuming_prompt(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+    prompt_result = await adapter.send_exec_approval(
+        chat_id=connection.chat_id,
+        command="rm -rf /tmp/example",
+        session_key="session-1",
+        metadata={"voice_session_prompt_id": "approval-invalid"},
+    )
+
+    await adapter._handle_payload(
+        connection,
+        {
+            "type": "prompt_response",
+            "prompt_id": prompt_result.message_id,
+            "prompt_kind": "approval",
+            "option_id": "maybe",
+        },
+    )
+
+    assert "approval-invalid" in adapter._pending_prompts
+    assert websocket.json_frames[-1] == {
+        "type": "prompt_response_rejected",
+        "prompt_id": "approval-invalid",
+        "reason": "invalid_option",
+        "session_id": "default",
+    }
+
+
+@pytest.mark.asyncio
+async def test_clarify_emits_choice_prompt_request(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+
+    result = await adapter.send_clarify(
+        chat_id=connection.chat_id,
+        question="Which environment?",
+        choices=["staging", "production"],
+        clarify_id="clarify-1",
+        session_key="session-1",
+        metadata={"voice_session_turn_id": "turn-1"},
+    )
+
+    assert result.success is True
+    prompt = websocket.json_frames[-1]
+    assert prompt["type"] == "prompt_request"
+    assert prompt["prompt_id"] == "clarify-1"
+    assert prompt["prompt_kind"] == "clarify"
+    assert prompt["turn_id"] == "turn-1"
+    assert prompt["text"] == "❓ Which environment?"
+    assert [option["id"] for option in prompt["options"]] == [
+        "c0",
+        "c1",
+        "other",
+    ]
+    assert prompt["sensitive"] is False
+
+
+@pytest.mark.asyncio
+async def test_clarify_response_resolves_choice_text_without_turn_dispatch(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+    resolved = []
+
+    monkeypatch.setattr(
+        "tools.clarify_gateway.resolve_gateway_clarify",
+        lambda clarify_id, response: resolved.append((clarify_id, response)) or True,
+    )
+    prompt_result = await adapter.send_clarify(
+        chat_id=connection.chat_id,
+        question="Which environment?",
+        choices=["staging", "production"],
+        clarify_id="clarify-response",
+        session_key="session-1",
+    )
+
+    await adapter._handle_payload(
+        connection,
+        {
+            "type": "prompt_response",
+            "prompt_id": prompt_result.message_id,
+            "prompt_kind": "clarify",
+            "option_id": "c1",
+        },
+    )
+
+    assert resolved == [("clarify-response", "production")]
+    assert websocket.json_frames[-1] == {
+        "type": "prompt_resolved",
+        "prompt_id": "clarify-response",
+        "prompt_kind": "clarify",
+        "status": "accepted",
+        "session_id": "default",
+    }
+
+
+@pytest.mark.asyncio
 async def test_text_draft_and_final_close_a_turn(monkeypatch):
     adapter = _adapter(monkeypatch)
     connection, websocket = _connection(adapter)
