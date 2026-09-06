@@ -10,6 +10,7 @@ channel, not a second Chat Completions client.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hmac
 import json
 import logging
@@ -58,6 +59,7 @@ MAX_ID_CHARS = 128
 MAX_DISPLAY_NAME_CHARS = 128
 MAX_RECENT_TURNS = 128
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_COMMAND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
 def _get_scoped_secret(name: str, default: str = "") -> str:
@@ -111,6 +113,15 @@ def _safe_id(value: Any, field_name: str, *, required: bool = True) -> str:
     return text
 
 
+def _safe_command(value: Any) -> str:
+    command = str(value or "").strip()
+    if command.startswith("/"):
+        command = command[1:]
+    if not _COMMAND_RE.fullmatch(command):
+        raise ValueError("invalid command")
+    return command.lower()
+
+
 def _bearer_token(headers: Any) -> str:
     raw = str(headers.get("Authorization", "") or "").strip()
     scheme, _, token = raw.partition(" ")
@@ -137,6 +148,7 @@ class _Connection:
     recent_turn_order: list[str] = field(default_factory=list)
     last_draft_text: str = ""
     resume_turn_id: Optional[str] = None
+    active_command_id: Optional[str] = None
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -145,6 +157,19 @@ class _VoiceSessionTTSHandle(StreamingTTSHandle):
     connection: Any = field(default=None, repr=False)
     turn_id: str = ""
     finished: bool = False
+
+
+@dataclass
+class _VoiceSessionCommandContext:
+    connection: _Connection
+    command_id: str
+    command: str
+    result_sent: bool = False
+
+
+_VOICE_SESSION_COMMAND_CONTEXT: contextvars.ContextVar[
+    Optional[_VoiceSessionCommandContext]
+] = contextvars.ContextVar("voice_session_command_context", default=None)
 
 
 class VoiceSessionAdapter(BasePlatformAdapter):
@@ -323,7 +348,12 @@ class VoiceSessionAdapter(BasePlatformAdapter):
                     "device_id": connection.device_id,
                     "session_id": connection.session_id,
                     "chat_id": connection.chat_id,
-                    "capabilities": ["text_stream", "pcm_s16le", "interrupt"],
+                    "capabilities": [
+                        "text_stream",
+                        "pcm_s16le",
+                        "interrupt",
+                        "command_dispatch",
+                    ],
                     "resume": {
                         "requested_turn_id": connection.resume_turn_id,
                         "known": bool(
@@ -445,13 +475,190 @@ class VoiceSessionAdapter(BasePlatformAdapter):
         if kind == "interrupt":
             await self._handle_interrupt(connection, payload)
             return
+        if kind == "command":
+            await self._handle_command(connection, payload)
+            return
         raise ValueError("unknown message type")
+
+    async def _handle_command(
+        self, connection: _Connection, payload: Dict[str, Any]
+    ) -> None:
+        command_id = _safe_id(
+            payload.get("command_id") or uuid.uuid4().hex,
+            "command_id",
+        )
+        command = _safe_command(payload.get("command"))
+        args = payload.get("args") or ""
+        if not isinstance(args, str):
+            raise ValueError("command args must be a string")
+        args = args.strip()
+        if len(args) > MAX_TRANSCRIPT_CHARS:
+            raise ValueError("command args are too long")
+
+        if connection.current_turn_id and not connection.turn_end_sent:
+            await self._send_command_result(
+                connection,
+                command_id=command_id,
+                command=command,
+                status="busy",
+                error="a turn is already in progress",
+            )
+            return
+        if connection.active_command_id:
+            await self._send_command_result(
+                connection,
+                command_id=command_id,
+                command=command,
+                status="busy",
+                error="another command is already in progress",
+            )
+            return
+
+        from hermes_cli.commands import is_gateway_known_command, resolve_command
+
+        command_def = resolve_command(command)
+        if not is_gateway_known_command(command):
+            await self._send_command_result(
+                connection,
+                command_id=command_id,
+                command=command,
+                status="unsupported",
+                error="command is not supported by the gateway",
+            )
+            return
+        canonical_command = command_def.name if command_def is not None else command
+
+        session_id = _safe_id(
+            payload.get("session_id") or connection.session_id,
+            "session_id",
+        )
+        connection.session_id = session_id
+        connection.active_command_id = command_id
+        event_text = f"/{command} {args}".rstrip()
+        source = self._source_for(connection, command_id)
+        event = MessageEvent(
+            text=event_text,
+            message_type=MessageType.TEXT,
+            user_id=connection.client_id,
+            user_name=connection.display_name or connection.client_id,
+            source=source,
+            raw_message=payload,
+            message_id=command_id,
+            metadata={
+                "voice_session_protocol": PROTOCOL_VERSION,
+                "voice_session_id": session_id,
+                "voice_session_command_id": command_id,
+                "voice_session_command": canonical_command,
+                "voice_session_client_id": connection.client_id,
+                "voice_session_device_id": connection.device_id,
+            },
+            timestamp=datetime.now(timezone.utc),
+            allow_gateway_control=True,
+        )
+        await self._send_json(
+            connection,
+            {
+                "type": "command_accepted",
+                "command_id": command_id,
+                "command": canonical_command,
+                "session_id": session_id,
+            },
+        )
+        await self.handle_message(event)
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        command_id = str(
+            (event.metadata or {}).get("voice_session_command_id") or ""
+        ).strip()
+        if not command_id:
+            await super().handle_message(event)
+            return
+
+        command = str(
+            (event.metadata or {}).get("voice_session_command")
+            or event.get_command()
+            or ""
+        ).strip()
+        connection = self._connections.get(event.source.chat_id)
+        if connection is None:
+            return
+        context = _VoiceSessionCommandContext(connection, command_id, command)
+        token = _VOICE_SESSION_COMMAND_CONTEXT.set(context)
+        try:
+            await super().handle_message(event)
+            from gateway.session import build_session_key
+
+            session_key = build_session_key(
+                event.source,
+                group_sessions_per_user=bool(
+                    (getattr(self.config, "extra", {}) or {}).get(
+                        "group_sessions_per_user", True
+                    )
+                ),
+                thread_sessions_per_user=bool(
+                    (getattr(self.config, "extra", {}) or {}).get(
+                        "thread_sessions_per_user", False
+                    )
+                ),
+                profile=self._session_key_profile(event.source),
+            )
+            task = self._session_tasks.get(session_key)
+            if task is not None and not task.done() and not context.result_sent:
+                asyncio.create_task(self._finish_command_after_task(task, context))
+            elif not context.result_sent:
+                await self._finish_command_context(context)
+        finally:
+            _VOICE_SESSION_COMMAND_CONTEXT.reset(token)
+
+    async def _finish_command_after_task(
+        self,
+        task: asyncio.Task,
+        context: _VoiceSessionCommandContext,
+    ) -> None:
+        try:
+            await task
+        except asyncio.CancelledError:
+            if not context.result_sent:
+                await self._finish_command_context(
+                    context, status="error", error="command was cancelled"
+                )
+            return
+        except Exception:
+            if not context.result_sent:
+                await self._finish_command_context(
+                    context, status="error", error="command failed"
+                )
+            return
+        if not context.result_sent:
+            await self._finish_command_context(context)
+
+    async def _finish_command_context(
+        self,
+        context: _VoiceSessionCommandContext,
+        *,
+        status: str = "ok",
+        error: Optional[str] = None,
+    ) -> None:
+        if context.result_sent:
+            return
+        await self._send_command_result(
+            context.connection,
+            command_id=context.command_id,
+            command=context.command,
+            status=status,
+            error=error,
+        )
+        context.result_sent = True
+        if context.connection.active_command_id == context.command_id:
+            context.connection.active_command_id = None
 
     async def _handle_turn(
         self, connection: _Connection, payload: Dict[str, Any]
     ) -> None:
         if connection.current_turn_id and not connection.turn_end_sent:
             raise ValueError("a turn is already in progress")
+        if connection.active_command_id:
+            raise ValueError("a command is already in progress")
 
         turn_id = _safe_id(payload.get("turn_id") or uuid.uuid4().hex, "turn_id")
         if turn_id in connection.recent_turns:
@@ -610,6 +817,25 @@ class VoiceSessionAdapter(BasePlatformAdapter):
                 retryable=True,
             )
         text = str(content or "")
+        command_context = _VOICE_SESSION_COMMAND_CONTEXT.get()
+        if command_context is not None and command_context.connection is connection:
+            ok = await self._send_command_result(
+                connection,
+                command_id=command_context.command_id,
+                command=command_context.command,
+                status="ok",
+                text=text,
+            )
+            if ok:
+                command_context.result_sent = True
+                if connection.active_command_id == command_context.command_id:
+                    connection.active_command_id = None
+            return SendResult(
+                success=ok,
+                message_id=command_context.command_id if ok else None,
+                error=None if ok else "voice-session socket closed",
+                retryable=not ok,
+            )
         if not text:
             return SendResult(success=True, message_id=None)
         metadata = metadata or {}
@@ -907,6 +1133,28 @@ class VoiceSessionAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Wire helpers
     # ------------------------------------------------------------------
+
+    async def _send_command_result(
+        self,
+        connection: _Connection,
+        *,
+        command_id: str,
+        command: str,
+        status: str,
+        text: str = "",
+        error: Optional[str] = None,
+    ) -> bool:
+        payload: Dict[str, Any] = {
+            "type": "command_result",
+            "command_id": command_id,
+            "command": command,
+            "status": status,
+            "text": str(text or ""),
+            "session_id": connection.session_id,
+        }
+        if error:
+            payload["error"] = str(error)
+        return await self._send_json(connection, payload)
 
     async def _send_json(
         self, connection: _Connection, payload: Dict[str, Any]
