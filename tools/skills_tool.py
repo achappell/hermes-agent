@@ -67,6 +67,7 @@ Usage:
 """
 
 import json
+import contextvars
 import logging
 import time
 import threading
@@ -76,7 +77,7 @@ import os
 import re
 from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Dict, Any, List, Optional, Set, Tuple
+from typing import Callable, Dict, Any, List, Optional, Set, Tuple
 
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get
@@ -189,6 +190,11 @@ def _is_remote_env_backend(backend: str) -> bool:
     except Exception:
         return False
 _secret_capture_callback = None
+_secret_capture_context_callback: contextvars.ContextVar[
+    Optional[Callable[..., Dict[str, Any]]]
+] = contextvars.ContextVar(
+    "secret_capture_context_callback", default=None
+)
 
 
 def _skill_lookup_path_error(name: str) -> Optional[str]:
@@ -262,6 +268,25 @@ _INJECTION_PATTERNS: list = [
 def set_secret_capture_callback(callback) -> None:
     global _secret_capture_callback
     _secret_capture_callback = callback
+
+
+def set_secret_capture_context_callback(callback):
+    """Install a context-scoped secret callback for one gateway turn."""
+
+    return _secret_capture_context_callback.set(callback)
+
+
+def reset_secret_capture_context_callback(token) -> None:
+    """Restore the previous context-scoped secret callback."""
+
+    _secret_capture_context_callback.reset(token)
+
+
+def _get_secret_capture_callback():
+    context_callback = _secret_capture_context_callback.get()
+    if context_callback is not None:
+        return context_callback
+    return _secret_capture_callback
 
 
 def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
@@ -445,7 +470,8 @@ def _capture_required_environment_variables(
             "gateway_setup_hint": _gateway_setup_hint(),
         }
 
-    if _secret_capture_callback is None:
+    secret_capture_callback = _get_secret_capture_callback()
+    if secret_capture_callback is None:
         return {
             "missing_names": missing_names,
             "setup_skipped": False,
@@ -463,7 +489,7 @@ def _capture_required_environment_variables(
             metadata["required_for"] = entry["required_for"]
 
         try:
-            callback_result = _secret_capture_callback(
+            callback_result = secret_capture_callback(
                 entry["name"],
                 entry["prompt"],
                 metadata,
