@@ -102,7 +102,7 @@ def _capture_required_environment_variables(
             hint = (f"Secure secret entry is not available. Load this skill in the local CLI to be "
                     f"prompted, or add the key to {display_hermes_home()}/.env manually.")
         return _capture_result(missing_names, gateway_setup_hint=hint)
-    if (callback := _st._secret_capture_callback) is None:
+    if (callback := _st._get_secret_capture_callback()) is None:
         return _capture_result(missing_names)
     remaining_names: List[str] = []
     for entry in missing_entries:

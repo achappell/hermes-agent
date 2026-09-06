@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Future
 
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.base import AudioFormat, MessageType
+from gateway.platforms.base import AudioFormat, BasePlatformAdapter, MessageType
 from plugins.platforms.voice_session.adapter import (
+    MAX_TRANSCRIPT_CHARS,
     PROTOCOL_VERSION,
     VoiceSessionAdapter,
     _Connection,
@@ -347,6 +349,287 @@ async def test_invalid_prompt_response_is_rejected_without_consuming_prompt(monk
         "reason": "invalid_option",
         "session_id": "default",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method_name", "prompt_kind", "prompt_id"),
+    [
+        ("send_sudo_password", "sudo", "sudo-1"),
+        ("send_secret", "secret", "secret-1"),
+    ],
+)
+async def test_sensitive_prompt_resolves_value_without_echo(
+    monkeypatch, method_name, prompt_kind, prompt_id
+):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+
+    result = await getattr(adapter, method_name)(
+        chat_id=connection.chat_id,
+        prompt="Enter the value",
+        session_key="session-1",
+        prompt_id=prompt_id,
+    )
+
+    assert result.success is True
+    assert websocket.json_frames[-1] == {
+        "type": "prompt_request",
+        "prompt_id": prompt_id,
+        "prompt_kind": prompt_kind,
+        "turn_id": "",
+        "session_id": "default",
+        "text": "Enter the value",
+        "options": [],
+        "sensitive": True,
+        "timeout_s": 300,
+    }
+    response_future = adapter._pending_prompts[prompt_id].response_future
+    assert isinstance(response_future, Future)
+
+    await adapter._handle_payload(
+        connection,
+        {
+            "type": "prompt_response",
+            "prompt_id": prompt_id,
+            "prompt_kind": prompt_kind,
+            "value": "do-not-echo-this",
+        },
+    )
+
+    assert response_future.result(timeout=0) == "do-not-echo-this"
+    assert prompt_id not in adapter._pending_prompts
+    assert websocket.json_frames[-1] == {
+        "type": "prompt_resolved",
+        "prompt_id": prompt_id,
+        "prompt_kind": prompt_kind,
+        "status": "accepted",
+        "session_id": "default",
+    }
+    assert "do-not-echo-this" not in repr(websocket.json_frames)
+
+
+@pytest.mark.asyncio
+async def test_sensitive_prompt_disconnect_cancels_waiter_without_echo(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+
+    result = await adapter.send_secret(
+        chat_id=connection.chat_id,
+        prompt="Enter the API key",
+        session_key="session-1",
+        prompt_id="secret-disconnect",
+    )
+    response_future = adapter._pending_prompts[result.message_id].response_future
+    assert isinstance(response_future, Future)
+
+    await adapter._close_connection(connection)
+
+    assert response_future.result(timeout=0) == ""
+    assert "secret-disconnect" not in adapter._pending_prompts
+
+
+@pytest.mark.asyncio
+async def test_sensitive_prompt_timeout_cancels_waiter_without_echo(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+    monkeypatch.setattr(
+        "plugins.platforms.voice_session.adapter.DEFAULT_PROMPT_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    value = await adapter._request_sensitive_value(
+        "secret",
+        "Enter the API key",
+        "secret-timeout",
+        {"_voice_session_chat_id": connection.chat_id},
+    )
+
+    assert value == ""
+    assert "secret-timeout" not in adapter._pending_prompts
+    assert [frame["type"] for frame in websocket.json_frames] == [
+        "prompt_request"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unknown_and_duplicate_prompt_responses_are_rejected(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+    adapter.handle_message = pytest.fail
+
+    await adapter._handle_payload(
+        connection,
+        {
+            "type": "prompt_response",
+            "prompt_id": "unknown-prompt",
+            "prompt_kind": "secret",
+            "value": "not-used",
+        },
+    )
+    assert websocket.json_frames[-1]["reason"] == "unknown"
+
+    result = await adapter.send_secret(
+        chat_id=connection.chat_id,
+        prompt="Enter the API key",
+        session_key="session-1",
+        prompt_id="secret-duplicate",
+    )
+    response = {
+        "type": "prompt_response",
+        "prompt_id": result.message_id,
+        "prompt_kind": "secret",
+        "value": "one-time-value",
+    }
+    await adapter._handle_payload(connection, response)
+    await adapter._handle_payload(connection, response)
+
+    assert websocket.json_frames[-1] == {
+        "type": "prompt_response_rejected",
+        "prompt_id": "secret-duplicate",
+        "reason": "duplicate",
+        "session_id": "default",
+    }
+    assert "one-time-value" not in repr(websocket.json_frames)
+
+
+@pytest.mark.asyncio
+async def test_mismatched_and_malformed_sensitive_responses_stay_pending(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+
+    result = await adapter.send_secret(
+        chat_id=connection.chat_id,
+        prompt="Enter the API key",
+        session_key="session-1",
+        prompt_id="secret-invalid",
+    )
+    prompt_id = result.message_id
+
+    await adapter._handle_payload(
+        connection,
+        {
+            "type": "prompt_response",
+            "prompt_id": prompt_id,
+            "prompt_kind": "sudo",
+            "value": "not-used",
+        },
+    )
+    assert prompt_id in adapter._pending_prompts
+    assert websocket.json_frames[-1]["reason"] == "kind_mismatch"
+
+    for value, reason in (
+        (None, "value_required"),
+        ("x" * (MAX_TRANSCRIPT_CHARS + 1), "value_too_long"),
+    ):
+        await adapter._handle_payload(
+            connection,
+            {
+                "type": "prompt_response",
+                "prompt_id": prompt_id,
+                "prompt_kind": "secret",
+                "value": value,
+            },
+        )
+        assert prompt_id in adapter._pending_prompts
+        assert websocket.json_frames[-1]["reason"] == reason
+
+    with pytest.raises(ValueError, match="invalid prompt_id"):
+        await adapter._handle_payload(
+            connection,
+            {
+                "type": "prompt_response",
+                "prompt_id": "not valid",
+                "prompt_kind": "secret",
+                "value": "not-used",
+            },
+        )
+    assert prompt_id in adapter._pending_prompts
+
+
+@pytest.mark.asyncio
+async def test_turn_installs_context_scoped_sudo_and_secret_bridges(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, _websocket = _connection(adapter)
+    seen = {"requests": []}
+
+    async def inspect_context(_self, _event):
+        from tools import skills_tool, terminal_tool
+
+        seen["sudo"] = terminal_tool._get_sudo_password_callback()
+        seen["secret"] = skills_tool._get_secret_capture_callback()
+
+    async def fake_sensitive_value(kind, prompt, prompt_id, metadata):
+        seen["requests"].append((kind, prompt, prompt_id, metadata))
+        return "masked-value"
+
+    monkeypatch.setattr(adapter, "_request_sensitive_value", fake_sensitive_value)
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", inspect_context)
+
+    await adapter._handle_turn(
+        connection,
+        {"type": "turn", "turn_id": "bridge-turn", "text": "hello"},
+    )
+
+    assert callable(seen["sudo"])
+    assert callable(seen["secret"])
+    assert await asyncio.to_thread(seen["sudo"]) == "masked-value"
+    secret_result = await asyncio.to_thread(
+        seen["secret"], "API_KEY", "Enter API key", {"help": "provider key"}
+    )
+    assert secret_result == {
+        "success": True,
+        "stored_as": "API_KEY",
+        "validated": True,
+        "skipped": False,
+    }
+    assert [request[0] for request in seen["requests"]] == ["sudo", "secret"]
+
+
+@pytest.mark.asyncio
+async def test_sudo_bridge_round_trips_value_without_echo(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+    seen = {}
+
+    async def inspect_context(_self, _event):
+        from tools import terminal_tool
+
+        callback = terminal_tool._get_sudo_password_callback()
+        assert callback is not None
+        response_task = asyncio.create_task(asyncio.to_thread(callback))
+        seen["response_task"] = response_task
+        while not any(
+            frame.get("type") == "prompt_request" for frame in websocket.json_frames
+        ):
+            await asyncio.sleep(0)
+        prompt = next(
+            frame
+            for frame in websocket.json_frames
+            if frame.get("type") == "prompt_request"
+        )
+        assert prompt["prompt_kind"] == "sudo"
+        await adapter._handle_payload(
+            connection,
+            {
+                "type": "prompt_response",
+                "prompt_id": prompt["prompt_id"],
+                "prompt_kind": "sudo",
+                "value": "super-secret",
+            },
+        )
+        seen["value"] = await response_task
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", inspect_context)
+
+    await adapter._handle_turn(
+        connection,
+        {"type": "turn", "turn_id": "bridge-round-trip", "text": "hello"},
+    )
+
+    assert seen["value"] == "super-secret"
+    assert "super-secret" not in repr(websocket.json_frames)
+    assert websocket.json_frames[-1]["type"] == "prompt_resolved"
 
 
 @pytest.mark.asyncio

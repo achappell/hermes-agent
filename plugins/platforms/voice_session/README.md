@@ -81,9 +81,54 @@ audio is speaking; clients should wait for `turn_end` before sending one.
 Command results use the same WebSocket reader as turn events—there is no second
 receive loop.
 
+Clients that see the `structured_prompts` capability support typed interactive
+operations over that same reader. The server sends a correlated request when
+the gateway needs a user decision:
+
+```json
+{
+  "type": "prompt_request",
+  "prompt_id": "prompt-1",
+  "prompt_kind": "approval",
+  "turn_id": "turn-1",
+  "session_id": "default",
+  "text": "Command approval required",
+  "options": [
+    {"id": "once", "label": "Allow Once", "style": "primary"},
+    {"id": "deny", "label": "Deny", "style": "danger"}
+  ],
+  "sensitive": false,
+  "timeout_s": 300
+}
+```
+
+`prompt_kind` is `approval`, `confirm`, `clarify`, `sudo`, or `secret`.
+Approval and confirmation replies select an `option_id`; clarify replies use a
+known option or free-text `value`; sudo and secret replies use only `value` and
+must be presented as masked input. The client answers with:
+
+```json
+{
+  "type": "prompt_response",
+  "prompt_id": "prompt-1",
+  "prompt_kind": "approval",
+  "option_id": "once"
+}
+```
+
+Sensitive requests have `options: []` and `sensitive: true`. Their response
+value is delivered only to the waiting gateway operation. It is never included
+in `prompt_resolved`, rejection frames, logs, or error messages. An empty
+sensitive value cancels the operation. Clients should keep each prompt ID
+pending until a matching `prompt_resolved` or `prompt_response_rejected` arrives;
+duplicate, unknown, mismatched, missing, or oversized replies are rejected
+without becoming ordinary turns. A disconnected session cancels its sensitive
+waiters.
+
 Server messages are JSON (`hello_ack`, `turn_accepted`, `text_delta`, `text`,
 `text_final`, `status`, `audio_start`, `speech_timing`, `audio_end`, `turn_end`, `error`, and
-`command_accepted`, `command_result`, and interrupt events) interleaved with
+`command_accepted`, `command_result`, `prompt_request`, `prompt_resolved`,
+`prompt_response_rejected`, and interrupt events) interleaved with
 binary raw little-endian PCM frames. The
 `text_delta` payload is the accumulated draft preview and carries
 `replace: true`; clients should replace their preview (or append only the new
