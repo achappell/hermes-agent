@@ -6719,13 +6719,20 @@ class TurnRunner:
             # false positives from MagicMock auto-attribute creation in tests.
             if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
                 try:
+                    _approval_metadata = dict(ctx._status_thread_metadata or {})
+                    # Voice-session clients need the gateway approval request
+                    # id so a structured response can resolve the exact
+                    # waiting approval rather than relying on FIFO order.
+                    _approval_metadata["voice_session_prompt_id"] = str(
+                        approval_data.get("request_id") or ""
+                    )
                     _approval_fut = safe_schedule_threadsafe(
                         ctx._status_adapter.send_exec_approval(
                             chat_id=ctx._status_chat_id,
                             command=cmd,
                             session_key=_approval_session_key,
                             description=desc,
-                            metadata=ctx._status_thread_metadata,
+                            metadata=_approval_metadata,
                             allow_permanent=approval_data.get("allow_permanent", True),
                             allow_session=approval_data.get("allow_session", True),
                             smart_denied=approval_data.get("smart_denied", False),
@@ -10927,6 +10934,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True  # handled (silently dropped); do not fall through
 
         effective_mode = self._effective_busy_input_mode(event.source)
+        if (event.metadata or {}).get("voice_session_operation") == "steer":
+            # Explicit voice-session steering is already a typed operation;
+            # it must not inherit the surface's ordinary queue/interrupt
+            # policy or it would silently change meaning between clients.
+            effective_mode = "steer"
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:

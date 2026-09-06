@@ -58,6 +58,7 @@ MAX_TRANSCRIPT_CHARS = 32_000
 MAX_ID_CHARS = 128
 MAX_DISPLAY_NAME_CHARS = 128
 MAX_RECENT_TURNS = 128
+DEFAULT_PROMPT_TIMEOUT_SECONDS = 300
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _COMMAND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
@@ -167,6 +168,17 @@ class _VoiceSessionCommandContext:
     result_sent: bool = False
 
 
+@dataclass
+class _VoiceSessionPrompt:
+    prompt_id: str
+    prompt_kind: str
+    connection: _Connection
+    session_key: str = ""
+    turn_id: str = ""
+    option_ids: Set[str] = field(default_factory=set)
+    choice_values: Dict[str, str] = field(default_factory=dict)
+
+
 _VOICE_SESSION_COMMAND_CONTEXT: contextvars.ContextVar[
     Optional[_VoiceSessionCommandContext]
 ] = contextvars.ContextVar("voice_session_command_context", default=None)
@@ -219,6 +231,8 @@ class VoiceSessionAdapter(BasePlatformAdapter):
         # safely retry a turn without causing a second agent run.
         self._recent_turns_by_chat: Dict[str, Set[str]] = {}
         self._recent_turn_order_by_chat: Dict[str, list[str]] = {}
+        self._pending_prompts: Dict[str, _VoiceSessionPrompt] = {}
+        self._resolved_prompt_ids: Set[str] = set()
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -475,10 +489,76 @@ class VoiceSessionAdapter(BasePlatformAdapter):
         if kind == "interrupt":
             await self._handle_interrupt(connection, payload)
             return
+        if kind == "steer":
+            await self._handle_steer(connection, payload)
+            return
         if kind == "command":
             await self._handle_command(connection, payload)
             return
+        if kind == "prompt_response":
+            await self._handle_prompt_response(connection, payload)
+            return
         raise ValueError("unknown message type")
+
+    async def _handle_steer(
+        self, connection: _Connection, payload: Dict[str, Any]
+    ) -> None:
+        steer_id = _safe_id(
+            payload.get("steer_id") or uuid.uuid4().hex,
+            "steer_id",
+        )
+        turn_id = _safe_id(payload.get("turn_id"), "turn_id")
+        if (
+            turn_id != connection.current_turn_id
+            or connection.turn_end_sent
+        ):
+            await self._send_json(
+                connection,
+                {
+                    "type": "steer_rejected",
+                    "steer_id": steer_id,
+                    "turn_id": turn_id,
+                    "status": "stale_turn",
+                    "session_id": connection.session_id,
+                },
+            )
+            return
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            raise ValueError("steer text is empty")
+        if len(text) > MAX_TRANSCRIPT_CHARS:
+            raise ValueError("steer text is too long")
+
+        event = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            user_id=connection.client_id,
+            user_name=connection.display_name or connection.client_id,
+            source=self._source_for(connection, steer_id),
+            raw_message=payload,
+            message_id=steer_id,
+            metadata={
+                "voice_session_protocol": PROTOCOL_VERSION,
+                "voice_session_id": connection.session_id,
+                "voice_session_turn_id": turn_id,
+                "voice_session_steer_id": steer_id,
+                "voice_session_operation": "steer",
+                "voice_session_client_id": connection.client_id,
+                "voice_session_device_id": connection.device_id,
+            },
+            timestamp=datetime.now(timezone.utc),
+            allow_gateway_control=True,
+        )
+        await self.handle_message(event)
+        await self._send_json(
+            connection,
+            {
+                "type": "steer_accepted",
+                "steer_id": steer_id,
+                "turn_id": turn_id,
+                "session_id": connection.session_id,
+            },
+        )
 
     async def _handle_command(
         self, connection: _Connection, payload: Dict[str, Any]
@@ -565,6 +645,319 @@ class VoiceSessionAdapter(BasePlatformAdapter):
             },
         )
         await self.handle_message(event)
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+        allow_permanent: bool = True,
+        allow_session: bool = True,
+        smart_denied: bool = False,
+    ) -> SendResult:
+        """Send a structured approval request to the voice-session client."""
+
+        connection = self._connection_for_chat(chat_id, metadata)
+        if connection is None:
+            return SendResult(
+                success=False,
+                error="voice-session device is not connected",
+                retryable=True,
+            )
+
+        options: list[Dict[str, str]] = [
+            {"id": "once", "label": "Allow Once", "style": "primary"}
+        ]
+        if not smart_denied and allow_session:
+            options.append({"id": "session", "label": "Allow Session"})
+            if allow_permanent:
+                options.append({"id": "always", "label": "Always Allow"})
+        options.append({"id": "deny", "label": "Deny", "style": "danger"})
+
+        prompt_id = _safe_id(
+            (metadata or {}).get("voice_session_prompt_id") or uuid.uuid4().hex,
+            "prompt_id",
+        )
+        text = self._format_exec_approval(
+            command,
+            description,
+            smart_denied=smart_denied,
+        )
+        return await self._send_prompt_request(
+            connection,
+            prompt_id=prompt_id,
+            prompt_kind="approval",
+            session_key=session_key,
+            metadata=metadata,
+            text=text,
+            options=options,
+        )
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a structured clarify request to the voice-session client."""
+
+        connection = self._connection_for_chat(chat_id, metadata)
+        if connection is None:
+            return SendResult(
+                success=False,
+                error="voice-session device is not connected",
+                retryable=True,
+            )
+        prompt_id = _safe_id(clarify_id, "prompt_id")
+        options = [
+            {"id": f"c{index}", "label": str(choice)[:75]}
+            for index, choice in enumerate(choices or [])
+        ]
+        choice_values = {
+            f"c{index}": str(choice)
+            for index, choice in enumerate(choices or [])
+        }
+        if choices:
+            options.append({"id": "other", "label": "Other (type your answer)"})
+        return await self._send_prompt_request(
+            connection,
+            prompt_id=prompt_id,
+            prompt_kind="clarify",
+            session_key=session_key,
+            metadata=metadata,
+            text=f"❓ {question}",
+            options=options,
+            choice_values=choice_values,
+        )
+
+    async def send_slash_confirm(
+        self,
+        chat_id: str,
+        title: str,
+        message: str,
+        session_key: str,
+        confirm_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a structured confirmation request to the voice client."""
+
+        connection = self._connection_for_chat(chat_id, metadata)
+        if connection is None:
+            return SendResult(
+                success=False,
+                error="voice-session device is not connected",
+                retryable=True,
+            )
+        prompt_id = _safe_id(confirm_id, "prompt_id")
+        options = [
+            {"id": "once", "label": "Approve Once", "style": "primary"},
+            {"id": "always", "label": "Always Approve"},
+            {"id": "cancel", "label": "Cancel", "style": "danger"},
+        ]
+        text = f"{title}\n\n{message}" if title else str(message or "")
+        return await self._send_prompt_request(
+            connection,
+            prompt_id=prompt_id,
+            prompt_kind="confirm",
+            session_key=session_key,
+            metadata=metadata,
+            text=text,
+            options=options,
+        )
+
+    async def _send_prompt_request(
+        self,
+        connection: _Connection,
+        *,
+        prompt_id: str,
+        prompt_kind: str,
+        session_key: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+        text: str,
+        options: list[Dict[str, Any]],
+        sensitive: bool = False,
+        timeout_s: int = DEFAULT_PROMPT_TIMEOUT_SECONDS,
+        choice_values: Optional[Dict[str, str]] = None,
+    ) -> SendResult:
+        """Register and send one typed prompt without creating a turn."""
+
+        turn_id = str(
+            (metadata or {}).get("voice_session_turn_id")
+            or connection.current_turn_id
+            or ""
+        )
+        prompt = _VoiceSessionPrompt(
+            prompt_id=prompt_id,
+            prompt_kind=prompt_kind,
+            connection=connection,
+            session_key=str(session_key or ""),
+            turn_id=turn_id,
+            option_ids={str(option["id"]) for option in options if option.get("id")},
+            choice_values=dict(choice_values or {}),
+        )
+        self._pending_prompts[prompt_id] = prompt
+        payload: Dict[str, Any] = {
+            "type": "prompt_request",
+            "prompt_id": prompt_id,
+            "prompt_kind": prompt_kind,
+            "turn_id": turn_id,
+            "session_id": connection.session_id,
+            "text": str(text or ""),
+            "options": options,
+            "sensitive": bool(sensitive),
+            "timeout_s": int(timeout_s),
+        }
+        if not await self._send_json(connection, payload):
+            self._pending_prompts.pop(prompt_id, None)
+            return SendResult(
+                success=False,
+                error="voice-session socket closed",
+                retryable=True,
+            )
+        return SendResult(success=True, message_id=prompt_id)
+
+    async def _handle_prompt_response(
+        self, connection: _Connection, payload: Dict[str, Any]
+    ) -> None:
+        prompt_id = _safe_id(payload.get("prompt_id"), "prompt_id")
+        prompt = self._pending_prompts.get(prompt_id)
+        if prompt is None:
+            status = "duplicate" if prompt_id in self._resolved_prompt_ids else "unknown"
+            await self._send_prompt_rejected(connection, prompt_id, status)
+            return
+        if prompt.connection is not connection:
+            await self._send_prompt_rejected(connection, prompt_id, "wrong_connection")
+            return
+
+        prompt_kind = str(payload.get("prompt_kind") or "").strip().lower()
+        if prompt_kind and prompt_kind != prompt.prompt_kind:
+            await self._send_prompt_rejected(connection, prompt_id, "kind_mismatch")
+            return
+
+        if prompt.prompt_kind == "confirm":
+            option_id = str(payload.get("option_id") or "").strip().lower()
+            if option_id not in prompt.option_ids:
+                await self._send_prompt_rejected(connection, prompt_id, "invalid_option")
+                return
+
+            from tools import slash_confirm
+
+            result_text = await slash_confirm.resolve(
+                prompt.session_key, prompt_id, option_id
+            )
+            self._pending_prompts.pop(prompt_id, None)
+            self._resolved_prompt_ids.add(prompt_id)
+            resolved_payload: Dict[str, Any] = {
+                "type": "prompt_resolved",
+                "prompt_id": prompt_id,
+                "prompt_kind": prompt.prompt_kind,
+                "status": "accepted",
+                "session_id": connection.session_id,
+            }
+            if result_text:
+                resolved_payload["text"] = str(result_text)
+            await self._send_json(connection, resolved_payload)
+            return
+
+        if prompt.prompt_kind == "clarify":
+            option_id = str(payload.get("option_id") or "").strip().lower()
+            if option_id == "other":
+                response = str(payload.get("value") or "").strip()
+                if not response:
+                    await self._send_prompt_rejected(
+                        connection, prompt_id, "value_required"
+                    )
+                    return
+            elif option_id in prompt.choice_values:
+                response = prompt.choice_values[option_id]
+            else:
+                response = str(payload.get("value") or "").strip()
+                if not response:
+                    await self._send_prompt_rejected(
+                        connection, prompt_id, "invalid_option"
+                    )
+                    return
+
+            from tools.clarify_gateway import resolve_gateway_clarify
+
+            resolved = resolve_gateway_clarify(prompt_id, response)
+            if not resolved:
+                self._pending_prompts.pop(prompt_id, None)
+                await self._send_prompt_rejected(
+                    connection, prompt_id, "not_pending"
+                )
+                return
+            self._pending_prompts.pop(prompt_id, None)
+            self._resolved_prompt_ids.add(prompt_id)
+            await self._send_json(
+                connection,
+                {
+                    "type": "prompt_resolved",
+                    "prompt_id": prompt_id,
+                    "prompt_kind": prompt.prompt_kind,
+                    "status": "accepted",
+                    "session_id": connection.session_id,
+                },
+            )
+            return
+
+        if prompt.prompt_kind != "approval":
+            await self._send_prompt_rejected(connection, prompt_id, "unsupported")
+            return
+
+        option_id = str(payload.get("option_id") or "").strip().lower()
+        if option_id not in prompt.option_ids:
+            await self._send_prompt_rejected(connection, prompt_id, "invalid_option")
+            return
+        reason = str(payload.get("reason") or "").strip()
+        if len(reason) > MAX_TRANSCRIPT_CHARS:
+            await self._send_prompt_rejected(connection, prompt_id, "reason_too_long")
+            return
+
+        from tools.approval import resolve_gateway_approval
+
+        resolve_kwargs: Dict[str, Any] = {"request_id": prompt_id}
+        if reason:
+            resolve_kwargs["reason"] = reason
+        resolved = resolve_gateway_approval(
+            prompt.session_key, option_id, **resolve_kwargs
+        )
+        if not resolved:
+            self._pending_prompts.pop(prompt_id, None)
+            await self._send_prompt_rejected(connection, prompt_id, "not_pending")
+            return
+        self._pending_prompts.pop(prompt_id, None)
+        self._resolved_prompt_ids.add(prompt_id)
+        if len(self._resolved_prompt_ids) > MAX_RECENT_TURNS:
+            self._resolved_prompt_ids.pop()
+        await self._send_json(
+            connection,
+            {
+                "type": "prompt_resolved",
+                "prompt_id": prompt_id,
+                "prompt_kind": prompt.prompt_kind,
+                "status": "accepted",
+                "session_id": connection.session_id,
+            },
+        )
+
+    async def _send_prompt_rejected(
+        self, connection: _Connection, prompt_id: str, reason: str
+    ) -> None:
+        await self._send_json(
+            connection,
+            {
+                "type": "prompt_response_rejected",
+                "prompt_id": prompt_id,
+                "reason": reason,
+                "session_id": connection.session_id,
+            },
+        )
 
     async def handle_message(self, event: MessageEvent) -> None:
         command_id = str(
