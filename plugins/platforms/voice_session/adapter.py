@@ -134,15 +134,59 @@ def _get_session_db() -> Optional[Any]:
 
 
 def _get_active_model() -> str:
+    env_model = os.getenv("HERMES_MODEL", "").strip()
+    if env_model:
+        return env_model
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+        model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+        if isinstance(model_cfg, str) and model_cfg.strip():
+            return model_cfg.strip()
+        if isinstance(model_cfg, dict):
+            m = (
+                model_cfg.get("default")
+                or model_cfg.get("model")
+                or model_cfg.get("name")
+            )
+            if m and str(m).strip():
+                return str(m).strip()
+    except Exception:
+        pass
     try:
         from agent.config import get_model
 
         model = get_model()
         if model:
-            return str(model)
+            return str(model).strip()
     except Exception:
         pass
-    return os.getenv("HERMES_MODEL", "")
+    return ""
+
+
+def _get_context_limit() -> int | None:
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+        model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+        if isinstance(model_cfg, dict):
+            limit = model_cfg.get("context_length") or model_cfg.get("context_limit") or model_cfg.get("max_tokens")
+            if limit:
+                return int(limit)
+    except Exception:
+        pass
+    return None
+
+
+def _get_server_version() -> str:
+    try:
+        import hermes_cli
+
+        return str(getattr(hermes_cli, "__version__", "") or "0.21.0")
+    except Exception:
+        return "0.21.0"
 
 
 def _bearer_token(headers: Any) -> str:
@@ -405,6 +449,8 @@ class VoiceSessionAdapter(BasePlatformAdapter):
                     "session_id": connection.session_id,
                     "chat_id": connection.chat_id,
                     "model": _get_active_model(),
+                    "server_version": _get_server_version(),
+                    "context_limit": _get_context_limit(),
                     "title": title,
                     "capabilities": [
                         "text_stream",
@@ -777,6 +823,8 @@ class VoiceSessionAdapter(BasePlatformAdapter):
                 "type": "session_switched",
                 "session_id": new_session_id,
                 "model": _get_active_model(),
+                "server_version": _get_server_version(),
+                "context_limit": _get_context_limit(),
                 "title": title,
                 "history": [],
             },
@@ -812,6 +860,8 @@ class VoiceSessionAdapter(BasePlatformAdapter):
                 "type": "session_switched",
                 "session_id": session_id,
                 "model": model,
+                "server_version": _get_server_version(),
+                "context_limit": _get_context_limit(),
                 "title": title,
                 "history": history,
             },

@@ -1023,6 +1023,7 @@ async def test_session_new_creates_and_switches(monkeypatch):
     assert frame["session_id"] == "new-session-42"
     assert frame["title"] == "Fresh Topic"
     assert frame["model"] == "anthropic/claude-3-7-sonnet"
+    assert frame["server_version"] == "0.21.0"
     assert frame["history"] == []
 
 
@@ -1047,6 +1048,8 @@ async def test_session_switch_hydrates_history(monkeypatch):
 
     monkeypatch.setattr("plugins.platforms.voice_session.adapter._get_session_db", lambda: FakeSessionDB())
     monkeypatch.setattr("plugins.platforms.voice_session.adapter._get_active_model", lambda: "custom-model")
+    monkeypatch.setattr("plugins.platforms.voice_session.adapter._get_server_version", lambda: "0.21.0")
+    monkeypatch.setattr("plugins.platforms.voice_session.adapter._get_context_limit", lambda: 131072)
 
     await adapter._handle_payload(
         connection,
@@ -1060,8 +1063,11 @@ async def test_session_switch_hydrates_history(monkeypatch):
     assert frame["session_id"] == "sess-99"
     assert frame["title"] == "Geography Quiz"
     assert frame["model"] == "custom-model"
+    assert frame["server_version"] == "0.21.0"
+    assert frame["context_limit"] == 131072
     assert frame["history"] == [
         {"role": "user", "content": "What is the capital of France?"},
         {"role": "assistant", "content": "Paris."},
     ]
+
 
