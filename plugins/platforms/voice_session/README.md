@@ -47,9 +47,44 @@ The client may send `{"type":"interrupt","turn_id":"turn-1"}` to barge in,
 or `{"type":"ping"}` for an application-level liveness check. Binary ingress
 is deliberately not part of v1; microphone capture and STT stay on the client.
 
+Clients that see the `command_dispatch` capability may send an explicit
+gateway command without turning it into model input:
+
+```json
+{
+  "type": "command",
+  "command_id": "command-1",
+  "command": "status",
+  "args": "brief",
+  "session_id": "default"
+}
+```
+
+The relay acknowledges accepted commands with `command_accepted`, then routes
+the command through the existing gateway dispatcher and returns one correlated
+`command_result`:
+
+```json
+{
+  "type": "command_result",
+  "command_id": "command-1",
+  "command": "status",
+  "status": "ok",
+  "text": "...",
+  "session_id": "default"
+}
+```
+
+`status` is `unsupported` for commands the gateway does not expose and `busy`
+when a turn or another command is active. Command requests are rejected while
+audio is speaking; clients should wait for `turn_end` before sending one.
+Command results use the same WebSocket reader as turn events—there is no second
+receive loop.
+
 Server messages are JSON (`hello_ack`, `turn_accepted`, `text_delta`, `text`,
 `text_final`, `status`, `audio_start`, `speech_timing`, `audio_end`, `turn_end`, `error`, and
-interrupt events) interleaved with binary raw little-endian PCM frames. The
+`command_accepted`, `command_result`, and interrupt events) interleaved with
+binary raw little-endian PCM frames. The
 `text_delta` payload is the accumulated draft preview and carries
 `replace: true`; clients should replace their preview (or append only the new
 suffix), not print the whole payload as a token delta. The `audio_start`

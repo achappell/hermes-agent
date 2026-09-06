@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from gateway.config import PlatformConfig
@@ -88,6 +90,160 @@ async def test_turn_becomes_voice_event_with_local_stt_metadata(monkeypatch):
     assert event.source.thread_id == "default"
     assert event.metadata["stt_source"] == "local-whisper"
     assert {frame["type"] for frame in websocket.json_frames} == {"turn_accepted"}
+
+
+@pytest.mark.asyncio
+async def test_command_dispatch_reuses_gateway_event_path(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+    events = []
+
+    async def capture(event):
+        events.append(event)
+
+    adapter.handle_message = capture
+    await adapter._handle_payload(
+        connection,
+        {
+            "type": "command",
+            "command_id": "command-1",
+            "command": "status",
+            "args": "brief",
+        },
+    )
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.message_type is MessageType.TEXT
+    assert event.text == "/status brief"
+    assert event.metadata["voice_session_command_id"] == "command-1"
+    assert event.metadata["voice_session_command"] == "status"
+    assert [frame["type"] for frame in websocket.json_frames] == [
+        "command_accepted"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unsupported_command_is_reported_without_gateway_dispatch(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+    adapter.handle_message = _noop_handle_message
+
+    await adapter._handle_payload(
+        connection,
+        {
+            "type": "command",
+            "command_id": "command-unsupported",
+            "command": "not-a-gateway-command",
+        },
+    )
+
+    assert websocket.json_frames == [
+        {
+            "type": "command_result",
+            "command_id": "command-unsupported",
+            "command": "not-a-gateway-command",
+            "status": "unsupported",
+            "text": "",
+            "session_id": "default",
+            "error": "command is not supported by the gateway",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gateway_command_response_is_correlated_without_creating_a_turn(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+
+    async def respond(event):
+        assert event.text == "/status"
+        return "Gateway is healthy"
+
+    adapter.set_message_handler(respond)
+    await adapter._handle_payload(
+        connection,
+        {
+            "type": "command",
+            "command_id": "command-status",
+            "command": "status",
+        },
+    )
+
+    for _ in range(20):
+        if any(frame["type"] == "command_result" for frame in websocket.json_frames):
+            break
+        await asyncio.sleep(0)
+
+    assert websocket.json_frames[-1] == {
+        "type": "command_result",
+        "command_id": "command-status",
+        "command": "status",
+        "status": "ok",
+        "text": "Gateway is healthy",
+        "session_id": "default",
+    }
+    assert connection.current_turn_id is None
+    assert connection.active_command_id is None
+
+
+@pytest.mark.asyncio
+async def test_command_during_active_turn_returns_busy_without_dispatch(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+    connection.current_turn_id = "turn-active"
+    connection.turn_end_sent = False
+    adapter.handle_message = pytest.fail
+
+    await adapter._handle_payload(
+        connection,
+        {
+            "type": "command",
+            "command_id": "command-busy",
+            "command": "status",
+        },
+    )
+
+    assert websocket.json_frames == [
+        {
+            "type": "command_result",
+            "command_id": "command-busy",
+            "command": "status",
+            "status": "busy",
+            "text": "",
+            "session_id": "default",
+            "error": "a turn is already in progress",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gateway_command_without_text_still_completes(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    connection, websocket = _connection(adapter)
+
+    async def no_response(_event):
+        return None
+
+    adapter.set_message_handler(no_response)
+    await adapter._handle_payload(
+        connection,
+        {
+            "type": "command",
+            "command_id": "command-empty",
+            "command": "status",
+        },
+    )
+
+    for _ in range(20):
+        if any(frame["type"] == "command_result" for frame in websocket.json_frames):
+            break
+        await asyncio.sleep(0)
+
+    assert websocket.json_frames[-1]["type"] == "command_result"
+    assert websocket.json_frames[-1]["command_id"] == "command-empty"
+    assert websocket.json_frames[-1]["status"] == "ok"
+    assert websocket.json_frames[-1]["text"] == ""
 
 
 @pytest.mark.asyncio
