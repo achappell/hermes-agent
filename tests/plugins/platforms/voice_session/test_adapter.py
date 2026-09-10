@@ -1023,7 +1023,8 @@ async def test_session_new_creates_and_switches(monkeypatch):
     assert frame["session_id"] == "new-session-42"
     assert frame["title"] == "Fresh Topic"
     assert frame["model"] == "anthropic/claude-3-7-sonnet"
-    assert frame["server_version"] == "0.21.0"
+    from hermes_cli import __version__ as _hermes_version
+    assert frame["server_version"] == _hermes_version
     assert frame["history"] == []
 
 
