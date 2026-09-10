@@ -18,6 +18,7 @@ import/patch target): ``terminal_tool_config`` (TERMINAL_* reads, ``_quiet``),
 ``terminal_tool_result`` (foreground result post-processing).
 """
 
+import contextvars
 import json
 import logging
 import os
@@ -26,7 +27,7 @@ import time
 import threading
 import atexit
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, Callable, List
 
 logger = logging.getLogger(__name__)
 
@@ -82,10 +83,19 @@ DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env("TERMINAL_DISK_WARNING_
 # thread, can't stomp on each other (GHSA-qg5c-hvr5-hjgr). Gateway mode
 # resolves approvals via the per-session queue in tools.approval instead.
 _callback_tls = threading.local()
+_sudo_password_context_callback: contextvars.ContextVar[
+    Optional[Callable[[], str]]
+] = contextvars.ContextVar(
+    "sudo_password_context_callback", default=None
+)
 
 
 def _get_sudo_password_callback():
-    return getattr(_callback_tls, "sudo_password", None)
+    context_callback = _sudo_password_context_callback.get()
+    if context_callback is not None:
+        return context_callback
+    callback = getattr(_callback_tls, "sudo_password", None)
+    return callback
 
 
 def _get_approval_callback():
@@ -95,6 +105,18 @@ def _get_approval_callback():
 def set_sudo_password_callback(cb):
     """Register the CLI's sudo password prompt callback (per-thread slot)."""
     _callback_tls.sudo_password = cb
+
+
+def set_sudo_password_context_callback(cb):
+    """Install a context-scoped sudo callback for one gateway turn."""
+
+    return _sudo_password_context_callback.set(cb)
+
+
+def reset_sudo_password_context_callback(token) -> None:
+    """Restore the previous context-scoped sudo callback."""
+
+    _sudo_password_context_callback.reset(token)
 
 
 def set_approval_callback(cb):

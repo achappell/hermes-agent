@@ -6,6 +6,7 @@ synth path are all mocked. Covers the registry/resolver, provider availability,
 the chunked-streamer playback path, and the universal per-sentence sync fallback.
 """
 
+import json
 import os
 import queue
 import sys
@@ -93,6 +94,156 @@ def test_never_swaps_provider_for_streaming(monkeypatch):
     assert ts.resolve_streaming_provider({"provider": "edge"}) is None
 
 
+def test_speech_alignment_is_opt_in_and_has_a_hard_off_override(monkeypatch):
+    assert ts.speech_alignment_enabled({"streaming": {}}) is False
+    assert ts.speech_alignment_enabled(
+        {"streaming": {"alignment": {"enabled": True}}}
+    ) is True
+
+    monkeypatch.setenv("HERMES_SPEECH_ALIGNMENT", "off")
+    assert ts.speech_alignment_enabled(
+        {"streaming": {"alignment": {"enabled": True}}}
+    ) is False
+
+    monkeypatch.setenv("HERMES_SPEECH_ALIGNMENT", "on")
+    assert ts.speech_alignment_enabled({"streaming": {}}) is True
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ({"streaming": {}}, 4.0),
+        ({"streaming": {"alignment": {"timeout_seconds": 1.5}}}, 1.5),
+        ({"streaming": {"alignment": {"timeout_seconds": 0.1}}}, 0.5),
+        ({"streaming": {"alignment": {"timeout_seconds": 90}}}, 30.0),
+        ({"streaming": {"alignment": {"timeout_seconds": "bad"}}}, 4.0),
+    ],
+)
+def test_speech_alignment_timeout_is_bounded(config, expected):
+    assert ts.speech_alignment_timeout_seconds(config) == expected
+
+
+def test_openai_streamer_alignment_posts_pcm_without_affecting_streaming(monkeypatch):
+    captured = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, *_args):
+            return b'{"text":"Hermes moves.","words":[{"text":"Hermes","start_ms":0,"end_ms":220},{"text":"moves.","start_ms":220,"end_ms":510}]}'
+
+    def _urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        captured["body"] = request.data
+        return _Response()
+
+    monkeypatch.setattr(ts, "urlopen", _urlopen)
+    streamer = ts.OpenAIStreamer(
+        {
+            "streaming": {
+                "alignment": {
+                    "url": "http://qwen.example/v1/audio/align",
+                    "timeout_seconds": 1.5,
+                }
+            }
+        },
+        {"api_key": "unused", "base_url": "http://tts.example/v1"},
+    )
+
+    result = streamer.align("Hermes moves.", b"\x00\x00" * 2400)
+
+    assert result["text"] == "Hermes moves."
+    assert result["words"][1]["end_ms"] == 510
+    assert captured["url"] == "http://qwen.example/v1/audio/align"
+    assert captured["timeout"] == 1.5
+
+
+def test_openai_streamer_only_advertises_alignment_with_an_endpoint():
+    streamer = ts.OpenAIStreamer({"streaming": {}}, {"api_key": "unused"})
+
+    assert streamer.supports_alignment is False
+
+
+def test_qwen_streamer_advertises_and_uses_configured_alignment(monkeypatch):
+    captured = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, *_args):
+            return b'{"text":"Hermes moves.","words":[]}'
+
+    def _urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        return _Response()
+
+    monkeypatch.setattr(ts, "urlopen", _urlopen)
+    config = {
+        "streaming": {
+            "alignment": {
+                "enabled": True,
+                "url": "http://qwen.example/v1/audio/align",
+                "timeout_seconds": 2.0,
+            }
+        }
+    }
+    streamer = ts.QwenStreamer(config, {"base_url": "http://qwen.example/v1"})
+
+    assert streamer.supports_alignment is True
+    assert streamer.align("Hermes moves.", b"\x00\x00") == {
+        "text": "Hermes moves.",
+        "words": [],
+    }
+    assert captured == {
+        "url": "http://qwen.example/v1/audio/align",
+        "timeout": 2.0,
+    }
+
+
+def test_alignment_flattens_paragraph_whitespace_for_the_aligner(monkeypatch):
+    captured = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, *_args):
+            return b'{"text":"First line. Second line.","words":[]}'
+
+    def _urlopen(request, timeout):
+        captured["body"] = json.loads(request.data)
+        return _Response()
+
+    monkeypatch.setattr(ts, "urlopen", _urlopen)
+    streamer = ts.QwenStreamer(
+        {
+            "streaming": {
+                "alignment": {
+                    "url": "http://qwen.example/v1/audio/align",
+                }
+            }
+        },
+        {"base_url": "http://qwen.example/v1"},
+    )
+
+    streamer.align("First line.\n\nSecond line.", b"\x00\x00")
+
+    assert captured["body"]["input"] == "First line. Second line."
+
+
 # ── Built-in provider availability ───────────────────────────────────────
 
 
@@ -156,6 +307,67 @@ def test_openai_streamer_prefers_configured_api_key(monkeypatch):
 
 
 # ── Dispatch: chunked streamer path ──────────────────────────────────────
+
+
+
+def test_qwen_streamer_uses_chunked_endpoint_and_aligns_pcm(monkeypatch):
+    import types
+
+    captured = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def raise_for_status(self):
+            captured["status_checked"] = True
+
+        def iter_content(self, chunk_size):
+            captured["chunk_size"] = chunk_size
+            yield b"\x01"
+            yield b"\x00\x02\x00"
+
+    def _post(url, **kwargs):
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return _Response()
+
+    monkeypatch.setitem(sys.modules, "requests", types.SimpleNamespace(post=_post))
+    config = {
+        "provider": "openai",
+        "streaming": {"provider": "qwen"},
+        "qwen": {
+            "base_url": "http://queen:8767/v1",
+            "model": "qwen3-tts-streaming",
+            "voice": "capaldi-calm",
+            "language": "English",
+            "api_key": "local-qwen",
+        },
+    }
+
+    streamer = ts.resolve_streaming_provider(config)
+    assert isinstance(streamer, ts.QwenStreamer)
+    assert list(streamer.stream("Streaming adapter test.")) == [
+        b"\x01\x00\x02\x00"
+    ]
+    assert captured["url"] == "http://queen:8767/v1/audio/speech/stream"
+    assert captured["kwargs"]["stream"] is True
+    assert captured["kwargs"]["json"]["voice"] == "capaldi-calm"
+    assert captured["kwargs"]["json"]["language"] == "English"
+    assert captured["kwargs"]["json"]["response_format"] == "pcm"
+    assert captured["kwargs"]["headers"]["Authorization"] == "Bearer local-qwen"
+    assert captured["status_checked"] is True
+    assert captured["chunk_size"] == 8192
+
+
+def test_qwen_streamer_requires_an_endpoint():
+    assert ts.resolve_streaming_provider(
+        {"streaming": {"provider": "qwen"}}
+    ) is None
+
 
 
 def _drain_queue(sentences):

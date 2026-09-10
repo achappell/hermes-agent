@@ -56,6 +56,25 @@ _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 # offline update queue, #46621).
 _TELEGRAM_INITIAL_CONNECT_TIMEOUT_SECS_DEFAULT = 45.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+# A streamed voice turn can finish generating text before the last queued
+# sentence has finished synthesising. Ten seconds was enough for short probes,
+# but cut off longer replies at the exact point where the gateway finalised the
+# turn. Keep the drain bounded, while allowing a profile to tune it.
+_STREAMING_TTS_FINALIZATION_TIMEOUT_DEFAULT = 60.0
+_STREAMING_TTS_FINALIZATION_TIMEOUT_MAX = 600.0
+
+
+def _streaming_tts_finalization_timeout(tts_config: Optional[Dict[str, Any]]) -> float:
+    """Resolve the bounded post-agent streaming-TTS drain timeout."""
+    streaming_config = tts_config.get("streaming") if isinstance(tts_config, dict) else None
+    raw_timeout = streaming_config.get("finalization_timeout") if isinstance(streaming_config, dict) else None
+    try:
+        timeout = float(raw_timeout) if raw_timeout is not None else _STREAMING_TTS_FINALIZATION_TIMEOUT_DEFAULT
+    except (TypeError, ValueError):
+        timeout = _STREAMING_TTS_FINALIZATION_TIMEOUT_DEFAULT
+    return max(1.0, min(timeout, _STREAMING_TTS_FINALIZATION_TIMEOUT_MAX))
+
+
 # End reasons meaning the USER deliberately closed this thread. Shared by _classify_completion_target and
 # _resolve_async_delegation_session so they never disagree (else a "delivered" reason is acked, then lost).
 _USER_BOUNDARY_END_REASONS = ("session_reset", "user_exit", "session_switch", "new_session")

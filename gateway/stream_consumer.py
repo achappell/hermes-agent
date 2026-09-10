@@ -243,10 +243,14 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         progress = "\n".join(self._tool_progress_lines)
         return "\n\n---\n".join(p for p in (self._accumulated, progress) if p)
 
-    def _metadata_for_send(self, *, final: bool = False, expect_edits: bool = False) -> dict | None:
+    def _metadata_for_send(
+        self, *, final: bool = False, is_turn_final: bool = True, expect_edits: bool = False,
+    ) -> dict | None:
         """Per-send metadata.  ``final`` → notify=True (Mattermost treats notify-worthy sends
         as final when a broken thread root may fall back flat); ``expect_edits`` keeps
-        editable previews on Telegram's legacy send path."""
+        editable previews on Telegram's legacy send path. ``is_turn_final=False`` marks a
+        ``notify``-worthy send that only closes an interim segment, not the whole turn (some
+        adapters, including voice-session, otherwise read ``notify=True`` as the terminal frame)."""
         meta = dict(self.metadata) if self.metadata else {}
         if self._initial_reply_to_id:
             meta["reply_to_message_id"] = self._initial_reply_to_id
@@ -254,6 +258,12 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             meta["expect_edits"] = True
         if final:
             meta["notify"] = True
+            if not is_turn_final:
+                # A segment boundary closes only the current preview. Some
+                # adapters (including voice-session) interpret notify=True
+                # as the protocol's terminal text frame, so preserve the
+                # distinction explicitly until the actual turn completion.
+                meta["_interim_send"] = True
         return meta or None
 
     # Read-only views for the gateway (flag semantics: see _clear_turn_final_flags).

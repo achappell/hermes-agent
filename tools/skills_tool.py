@@ -5,12 +5,13 @@ scripts/. `skills_list` returns name/description only; `skill_view` returns full
 linked files. Sibling modules (skills_tool_setup / _plugin / _dedup) re-export here."""
 
 import json
+import contextvars
 import logging
 import os
 import time
 from contextlib import suppress
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import get_hermes_home
 from tools.registry import registry, tool_error
@@ -70,6 +71,11 @@ def _skills_dir() -> Path:
 
 
 _secret_capture_callback = None
+_secret_capture_context_callback: contextvars.ContextVar[
+    Optional[Callable[..., Dict[str, Any]]]
+] = contextvars.ContextVar(
+    "secret_capture_context_callback", default=None
+)
 _LOOKUP_HINT = "Use a skill name or relative path within the skills directory."
 
 
@@ -120,6 +126,25 @@ skill_matches_platform = _skill_utils_delegate("skill_matches_platform")
 skill_matches_environment = _skill_utils_delegate("skill_matches_environment")
 _parse_frontmatter = _skill_utils_delegate("parse_frontmatter")
 _get_disabled_skill_names = _skill_utils_delegate("get_disabled_skill_names")
+
+
+def set_secret_capture_context_callback(callback):
+    """Install a context-scoped secret callback for one gateway turn."""
+
+    return _secret_capture_context_callback.set(callback)
+
+
+def reset_secret_capture_context_callback(token) -> None:
+    """Restore the previous context-scoped secret callback."""
+
+    _secret_capture_context_callback.reset(token)
+
+
+def _get_secret_capture_callback():
+    context_callback = _secret_capture_context_callback.get()
+    if context_callback is not None:
+        return context_callback
+    return _secret_capture_callback
 
 
 def check_skills_requirements() -> bool:

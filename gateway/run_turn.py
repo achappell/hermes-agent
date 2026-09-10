@@ -1725,7 +1725,10 @@ class GatewayTurnMixin:
         if not _streaming_tts_done and self._should_send_voice_reply(
             event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):
-            await self._send_voice_reply(event, response)
+            if self._is_async_voice_reply():
+                asyncio.create_task(self._send_voice_reply(event, response))
+            else:
+                await self._send_voice_reply(event, response)
 
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.
@@ -3269,7 +3272,10 @@ class GatewayTurnMixin:
             return
         _stts.finish()
         try:
-            await _stts.wait_complete(timeout=10.0)
+            from gateway.run import _streaming_tts_finalization_timeout
+            from tools.tts_tool import _load_tts_config
+            _stts_timeout = _streaming_tts_finalization_timeout(_load_tts_config())
+            await _stts.wait_complete(timeout=_stts_timeout)
         except Exception as _stts_done_err:
             logger.debug("streaming TTS wait_complete error: %s", _stts_done_err)
         if not _stts.done:

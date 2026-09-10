@@ -675,6 +675,11 @@ class GatewayBusySessionMixin:
             return True  # handled (silently dropped); do not fall through
 
         effective_mode = self._effective_busy_input_mode(event.source)
+        if (event.metadata or {}).get("voice_session_operation") == "steer":
+            # Explicit voice-session steering is already a typed operation; it must not
+            # inherit the surface's ordinary queue/interrupt policy or it would silently
+            # change meaning between clients.
+            effective_mode = "steer"
         if self._draining:  # gateway restarting/stopping
             await self._send_busy_drain_notice(event, session_key, effective_mode)
             return True
