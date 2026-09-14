@@ -410,6 +410,14 @@ export function hiddenWindowsChildOptions(options = {}, isWindows = process.plat
 If the logic lives inline in a god-file and extraction feels disruptive, that is the signal to
 extract, not to regex around it.
 
+## Worktrees
+
+All linked feature and agent worktrees for this repository belong under
+`.worktrees/<name>` inside the repository's main checkout. Keep `.worktrees/`
+ignored and do not create sibling `*-worktrees` directories or use a global
+tool-specific worktree location. BMAD loop-managed run worktrees under
+`.bmad-loop/runs/<run>/worktrees/` are engine-owned and remain there.
+
 ## Routing Table — working in X → read X/AGENTS.md
 
 | Area | Read | Covers |
