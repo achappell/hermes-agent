@@ -1,0 +1,5 @@
+schema_version: 1
+repository: hermes-agent
+planning: not-applicable
+surfaces: []
+reason: This integration app has no Hermes Home delivery surface or BMAD story tracker.
